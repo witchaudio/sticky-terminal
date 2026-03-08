@@ -49,7 +49,7 @@ When you open the notes panel:
 1. choose a folder
 2. StickyTerminal will use a `StickyTerminal` folder there
 3. open or create a markdown note
-4. write in `Write` mode or switch to `Preview`
+4. write in one raw markdown note view
 
 ## Current themes
 

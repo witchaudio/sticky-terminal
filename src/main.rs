@@ -2,9 +2,6 @@
 
 use eframe::egui;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-use pulldown_cmark::{
-    CodeBlockKind, Event, HeadingLevel, Options, Parser as MarkdownParser, Tag, TagEnd,
-};
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -36,6 +33,7 @@ struct ThemePalette {
     selection: egui::Color32,
     terminal_bg: egui::Color32,
     sidebar_bg: egui::Color32,
+    sidebar_soft_bg: egui::Color32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,7 +70,6 @@ struct GhostStickiesApp {
     notes_root: Option<PathBuf>,
     current_note_file: Option<PathBuf>,
     note_status: String,
-    notes_preview_mode: bool,
     theme: ThemePreset,
     minimized: bool,
     sidebar_open: bool,
@@ -126,6 +123,7 @@ impl ThemePreset {
                 bg: egui::Color32::from_rgba_premultiplied(9, 13, 10, 214),
                 terminal_bg: egui::Color32::from_rgba_premultiplied(10, 13, 11, 242),
                 sidebar_bg: egui::Color32::from_rgba_premultiplied(16, 22, 18, 228),
+                sidebar_soft_bg: egui::Color32::from_rgba_premultiplied(20, 28, 23, 214),
                 bar_bg: egui::Color32::from_rgba_premultiplied(17, 22, 18, 240),
                 border: egui::Color32::from_rgba_premultiplied(90, 220, 150, 82),
                 text: egui::Color32::from_rgb(168, 255, 196),
@@ -136,6 +134,7 @@ impl ThemePreset {
                 bg: egui::Color32::from_rgba_premultiplied(18, 18, 20, 224),
                 terminal_bg: egui::Color32::from_rgba_premultiplied(15, 15, 17, 244),
                 sidebar_bg: egui::Color32::from_rgba_premultiplied(24, 24, 28, 232),
+                sidebar_soft_bg: egui::Color32::from_rgba_premultiplied(30, 30, 34, 216),
                 bar_bg: egui::Color32::from_rgba_premultiplied(24, 24, 28, 244),
                 border: egui::Color32::from_rgba_premultiplied(230, 230, 236, 66),
                 text: egui::Color32::from_rgb(242, 242, 246),
@@ -146,6 +145,7 @@ impl ThemePreset {
                 bg: egui::Color32::from_rgba_premultiplied(14, 24, 42, 224),
                 terminal_bg: egui::Color32::from_rgba_premultiplied(13, 18, 34, 244),
                 sidebar_bg: egui::Color32::from_rgba_premultiplied(20, 32, 54, 232),
+                sidebar_soft_bg: egui::Color32::from_rgba_premultiplied(28, 42, 68, 218),
                 bar_bg: egui::Color32::from_rgba_premultiplied(20, 30, 50, 244),
                 border: egui::Color32::from_rgba_premultiplied(120, 175, 255, 84),
                 text: egui::Color32::from_rgb(215, 234, 255),
@@ -156,6 +156,7 @@ impl ThemePreset {
                 bg: egui::Color32::from_rgba_premultiplied(40, 14, 16, 224),
                 terminal_bg: egui::Color32::from_rgba_premultiplied(28, 10, 12, 244),
                 sidebar_bg: egui::Color32::from_rgba_premultiplied(48, 18, 20, 232),
+                sidebar_soft_bg: egui::Color32::from_rgba_premultiplied(58, 24, 26, 218),
                 bar_bg: egui::Color32::from_rgba_premultiplied(46, 18, 20, 244),
                 border: egui::Color32::from_rgba_premultiplied(255, 130, 130, 92),
                 text: egui::Color32::from_rgb(255, 220, 220),
@@ -644,7 +645,6 @@ impl Default for GhostStickiesApp {
             notes_root: None,
             current_note_file: None,
             note_status: "Set your StickyTerminal notes folder to start saving notes.".to_owned(),
-            notes_preview_mode: false,
             theme: ThemePreset::default(),
             minimized: false,
             sidebar_open: false,
@@ -913,226 +913,12 @@ impl GhostStickiesApp {
         self.save_config();
     }
 
-    fn markdown_text_format(
-        ui: &egui::Ui,
-        color: egui::Color32,
-        size: f32,
-        monospace: bool,
-        _strong: bool,
-        italic: bool,
-        underline: bool,
-    ) -> egui::TextFormat {
-        let mut font_id = if monospace {
-            egui::TextStyle::Monospace.resolve(ui.style())
-        } else {
-            egui::TextStyle::Body.resolve(ui.style())
-        };
-        font_id.size = size;
-
-        egui::TextFormat {
-            font_id,
-            color,
-            italics: italic,
-            underline: if underline {
-                egui::Stroke::new(1.0, color)
-            } else {
-                egui::Stroke::NONE
-            },
-            ..Default::default()
-        }
-    }
-
-    fn append_markdown_text(
-        ui: &egui::Ui,
-        job: &mut egui::text::LayoutJob,
-        text: &str,
-        color: egui::Color32,
-        heading: Option<HeadingLevel>,
-        strong: bool,
-        italic: bool,
-        monospace: bool,
-        underline: bool,
-    ) {
-        let size = match heading {
-            Some(HeadingLevel::H1) => 28.0,
-            Some(HeadingLevel::H2) => 24.0,
-            Some(HeadingLevel::H3) => 21.0,
-            Some(HeadingLevel::H4) => 19.0,
-            Some(HeadingLevel::H5) => 17.0,
-            Some(HeadingLevel::H6) => 16.0,
-            None => {
-                if monospace {
-                    egui::TextStyle::Monospace.resolve(ui.style()).size
-                } else {
-                    egui::TextStyle::Body.resolve(ui.style()).size
-                }
-            }
-        };
-
-        let mut format =
-            Self::markdown_text_format(ui, color, size, monospace, strong, italic, underline);
-        if strong {
-            format.font_id.size += 1.0;
-        }
-
-        job.append(text, 0.0, format);
-    }
-
-    fn flush_markdown_job(ui: &mut egui::Ui, job: &mut egui::text::LayoutJob) {
-        if !job.text.is_empty() {
-            let output = std::mem::take(job);
-            ui.label(output);
-        }
-    }
-
-    fn render_markdown(ui: &mut egui::Ui, markdown: &str, color: egui::Color32) {
-        let mut options = Options::empty();
-        options.insert(Options::ENABLE_TABLES);
-        options.insert(Options::ENABLE_TASKLISTS);
-        options.insert(Options::ENABLE_STRIKETHROUGH);
-
-        let parser = MarkdownParser::new_ext(markdown, options);
-        let mut job = egui::text::LayoutJob::default();
-        let mut heading = None;
-        let mut strong = false;
-        let mut italic = false;
-        let mut in_code_block = false;
-        let mut current_link: Option<String> = None;
-        let mut list_depth: usize = 0;
-
-        for event in parser {
-            match event {
-                Event::Start(tag) => match tag {
-                    Tag::Paragraph => {}
-                    Tag::Heading { level, .. } => {
-                        Self::flush_markdown_job(ui, &mut job);
-                        heading = Some(level);
-                    }
-                    Tag::BlockQuote(_) => {
-                        Self::flush_markdown_job(ui, &mut job);
-                        Self::append_markdown_text(
-                            ui, &mut job, "│ ", color, None, false, false, false, false,
-                        );
-                    }
-                    Tag::CodeBlock(kind) => {
-                        Self::flush_markdown_job(ui, &mut job);
-                        in_code_block = true;
-                        let label = match kind {
-                            CodeBlockKind::Fenced(name) if !name.is_empty() => {
-                                format!("```{name}\n")
-                            }
-                            _ => "```\n".to_owned(),
-                        };
-                        Self::append_markdown_text(
-                            ui, &mut job, &label, color, None, false, false, true, false,
-                        );
-                    }
-                    Tag::List(_) => {
-                        list_depth += 1;
-                    }
-                    Tag::Item => {
-                        if !job.text.is_empty() {
-                            Self::flush_markdown_job(ui, &mut job);
-                        }
-                        let indent = "  ".repeat(list_depth.saturating_sub(1));
-                        let bullet = format!("{indent}• ");
-                        Self::append_markdown_text(
-                            ui, &mut job, &bullet, color, None, false, false, false, false,
-                        );
-                    }
-                    Tag::Emphasis => italic = true,
-                    Tag::Strong => strong = true,
-                    Tag::Link { dest_url, .. } => current_link = Some(dest_url.to_string()),
-                    _ => {}
-                },
-                Event::End(tag) => match tag {
-                    TagEnd::Paragraph => {
-                        Self::flush_markdown_job(ui, &mut job);
-                        ui.add_space(6.0);
-                    }
-                    TagEnd::Heading(_) => {
-                        Self::flush_markdown_job(ui, &mut job);
-                        ui.add_space(6.0);
-                        heading = None;
-                    }
-                    TagEnd::BlockQuote(_) => {
-                        Self::flush_markdown_job(ui, &mut job);
-                        ui.add_space(4.0);
-                    }
-                    TagEnd::CodeBlock => {
-                        Self::append_markdown_text(
-                            ui, &mut job, "\n```", color, None, false, false, true, false,
-                        );
-                        Self::flush_markdown_job(ui, &mut job);
-                        ui.add_space(6.0);
-                        in_code_block = false;
-                    }
-                    TagEnd::List(_) => {
-                        list_depth = list_depth.saturating_sub(1);
-                        if !job.text.is_empty() {
-                            Self::flush_markdown_job(ui, &mut job);
-                        }
-                    }
-                    TagEnd::Item => {
-                        Self::flush_markdown_job(ui, &mut job);
-                    }
-                    TagEnd::Emphasis => italic = false,
-                    TagEnd::Strong => strong = false,
-                    TagEnd::Link => current_link = None,
-                    _ => {}
-                },
-                Event::Text(text) => {
-                    Self::append_markdown_text(
-                        ui,
-                        &mut job,
-                        &text,
-                        color,
-                        heading,
-                        strong,
-                        italic,
-                        in_code_block,
-                        current_link.is_some(),
-                    );
-                }
-                Event::Code(text) => {
-                    Self::append_markdown_text(
-                        ui, &mut job, &text, color, heading, strong, italic, true, false,
-                    );
-                }
-                Event::SoftBreak | Event::HardBreak => {
-                    Self::append_markdown_text(
-                        ui,
-                        &mut job,
-                        "\n",
-                        color,
-                        heading,
-                        strong,
-                        italic,
-                        in_code_block,
-                        false,
-                    );
-                }
-                Event::Rule => {
-                    Self::flush_markdown_job(ui, &mut job);
-                    ui.separator();
-                    ui.add_space(6.0);
-                }
-                Event::Html(html) | Event::InlineHtml(html) => {
-                    Self::append_markdown_text(
-                        ui, &mut job, &html, color, heading, false, false, true, false,
-                    );
-                }
-                Event::TaskListMarker(checked) => {
-                    let marker = if checked { "[x] " } else { "[ ] " };
-                    Self::append_markdown_text(
-                        ui, &mut job, marker, color, heading, false, false, true, false,
-                    );
-                }
-                _ => {}
-            }
-        }
-
-        Self::flush_markdown_job(ui, &mut job);
+    fn note_surface_frame(palette: ThemePalette) -> egui::Frame {
+        egui::Frame::NONE
+            .fill(palette.sidebar_soft_bg)
+            .stroke(egui::Stroke::new(1.0, palette.border))
+            .corner_radius(egui::CornerRadius::same(12))
+            .inner_margin(egui::Margin::same(10))
     }
 
     #[cfg(target_os = "macos")]
@@ -1681,13 +1467,31 @@ impl eframe::App for GhostStickiesApp {
                     egui::Frame::NONE
                         .fill(palette.sidebar_bg)
                         .stroke(egui::Stroke::new(1.0, palette.border))
-                        .inner_margin(egui::Margin::same(10)),
+                        .inner_margin(egui::Margin::same(12)),
                 )
                 .show(ctx, |ui| {
                     let mut choose_folder = false;
                     let mut open_note = false;
                     let mut save_note = false;
                     let mut new_note = false;
+                    let folder_text = self
+                        .notes_root
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "No folder selected".to_owned());
+                    let note_text = self
+                        .current_note_file
+                        .as_ref()
+                        .map(|path| {
+                            if let Some(root) = &self.notes_root {
+                                path.strip_prefix(root)
+                                    .map(|relative| relative.display().to_string())
+                                    .unwrap_or_else(|_| path.display().to_string())
+                            } else {
+                                path.display().to_string()
+                            }
+                        })
+                        .unwrap_or_else(|| "No note selected".to_owned());
 
                     ui.horizontal(|ui| {
                         ui.label(
@@ -1705,110 +1509,82 @@ impl eframe::App for GhostStickiesApp {
                             }
                         });
                     });
-                    ui.label(
-                        egui::RichText::new(
-                            "One markdown note, saved inside your StickyTerminal folder",
-                        )
-                        .small()
-                        .color(palette.muted_text),
-                    );
                     ui.add_space(8.0);
 
-                    ui.label(
-                        egui::RichText::new("Notes folder")
-                            .small()
-                            .color(palette.muted_text),
-                    );
-                    ui.horizontal(|ui| {
-                        let folder_text = self
-                            .notes_root
-                            .as_ref()
-                            .map(|path| path.display().to_string())
-                            .unwrap_or_else(|| "No folder selected".to_owned());
-                        ui.label(egui::RichText::new(folder_text).small().color(palette.text));
-                        if ui.button("Choose").clicked() {
-                            choose_folder = true;
-                        }
+                    Self::note_surface_frame(palette).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Folder")
+                                        .small()
+                                        .color(palette.muted_text),
+                                );
+                                ui.label(
+                                    egui::RichText::new(&folder_text)
+                                        .small()
+                                        .color(palette.text),
+                                );
+                            });
+
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Choose").clicked() {
+                                        choose_folder = true;
+                                    }
+                                },
+                            );
+                        });
+
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Note")
+                                        .small()
+                                        .color(palette.muted_text),
+                                );
+                                ui.label(
+                                    egui::RichText::new(&note_text)
+                                        .small()
+                                        .color(palette.text),
+                                );
+                            });
+
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Save").clicked() {
+                                        save_note = true;
+                                    }
+                                    if ui.button("New").clicked() {
+                                        new_note = true;
+                                    }
+                                    if ui.button("Open").clicked() {
+                                        open_note = true;
+                                    }
+                                },
+                            );
+                        });
+                    });
+
+                    ui.add_space(10.0);
+                    let editor_height = ui.available_height().max(220.0);
+                    Self::note_surface_frame(palette).show(ui, |ui| {
+                        let editor = egui::TextEdit::multiline(&mut self.notes_markdown)
+                            .code_editor()
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(18)
+                            .hint_text("Write markdown here.");
+                        ui.add_sized([ui.available_width(), editor_height], editor);
                     });
 
                     ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("Current note")
-                            .small()
-                            .color(palette.muted_text),
-                    );
-                    ui.horizontal(|ui| {
-                        let note_text = self
-                            .current_note_file
-                            .as_ref()
-                            .map(|path| {
-                                if let Some(root) = &self.notes_root {
-                                    path.strip_prefix(root)
-                                        .map(|relative| relative.display().to_string())
-                                        .unwrap_or_else(|_| path.display().to_string())
-                                } else {
-                                    path.display().to_string()
-                                }
-                            })
-                            .unwrap_or_else(|| "No note selected".to_owned());
-                        ui.label(egui::RichText::new(note_text).small().color(palette.text));
-                        if ui.button("Open").clicked() {
-                            open_note = true;
-                        }
-                        if ui.button("New").clicked() {
-                            new_note = true;
-                        }
-                        if ui.button("Save").clicked() {
-                            save_note = true;
-                        }
-                    });
-
-                    if let Some(path) = self.note_file_path() {
-                        ui.label(
-                            egui::RichText::new(path.display().to_string())
-                                .small()
-                                .color(palette.muted_text),
-                        );
-                    }
-
-                    ui.add_space(6.0);
                     ui.label(
                         egui::RichText::new(&self.note_status)
                             .small()
                             .color(palette.muted_text),
                     );
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.notes_preview_mode, false, "Write");
-                        ui.selectable_value(&mut self.notes_preview_mode, true, "Preview");
-                    });
-                    ui.add_space(8.0);
-
-                    if self.notes_preview_mode {
-                        egui::Frame::NONE
-                            .fill(palette.terminal_bg)
-                            .stroke(egui::Stroke::new(1.0, palette.border))
-                            .corner_radius(egui::CornerRadius::same(10))
-                            .inner_margin(egui::Margin::same(10))
-                            .show(ui, |ui| {
-                                egui::ScrollArea::vertical()
-                                    .auto_shrink([false, false])
-                                    .show(ui, |ui| {
-                                        Self::render_markdown(
-                                            ui,
-                                            &self.notes_markdown,
-                                            palette.text,
-                                        );
-                                    });
-                            });
-                    } else {
-                        let editor = egui::TextEdit::multiline(&mut self.notes_markdown)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(24)
-                            .hint_text("Write markdown here, then press Save.");
-                        ui.add_sized([ui.available_width(), ui.available_height()], editor);
-                    }
 
                     if choose_folder {
                         self.choose_notes_root();
