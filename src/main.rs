@@ -6,7 +6,8 @@ use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 use vt100::Parser;
@@ -18,12 +19,15 @@ use objc::{class, msg_send, sel, sel_impl};
 
 const WINDOW_WIDTH: f32 = 1180.0;
 const WINDOW_HEIGHT: f32 = 760.0;
-const TOP_BAR_HEIGHT: f32 = 34.0;
+const TOP_BAR_HEIGHT: f32 = 40.0;
+const TAB_BAR_HEIGHT: f32 = 38.0;
 const MINIMIZED_HEIGHT: f32 = 40.0;
 const SIDEBAR_DEFAULT_WIDTH: f32 = 340.0;
 const TERMINAL_SCROLLBACK: usize = 5_000;
+const PANE_SEPARATOR_WIDTH: f32 = 1.0;
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 struct ThemePalette {
     bg: egui::Color32,
     bar_bg: egui::Color32,
@@ -34,14 +38,22 @@ struct ThemePalette {
     terminal_bg: egui::Color32,
     sidebar_bg: egui::Color32,
     sidebar_soft_bg: egui::Color32,
+    accent: egui::Color32,
+    accent_dim: egui::Color32,
+    tab_bg: egui::Color32,
+    active_tab_bg: egui::Color32,
+    tab_text: egui::Color32,
+    active_tab_text: egui::Color32,
+    input_bg: egui::Color32,
+    surface: egui::Color32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum ThemePreset {
+    Warp,
+    WarpLight,
     Terminal,
-    Black,
-    Blue,
-    Red,
+    Midnight,
 }
 
 #[derive(Clone, Copy)]
@@ -50,8 +62,9 @@ struct TerminalPoint {
     col: u16,
 }
 
-struct TerminalTab {
-    title: String,
+// ── A single terminal session (pane) ──
+struct TerminalPane {
+    uid: u64, // unique ID that survives reordering
     cwd: PathBuf,
     parser: Parser,
     rx: Option<Receiver<Vec<u8>>>,
@@ -65,11 +78,19 @@ struct TerminalTab {
     selection: Option<(TerminalPoint, TerminalPoint)>,
 }
 
+// ── A tab containing one or more panes ──
+struct TerminalTab {
+    title: String,
+    panes: Vec<TerminalPane>,
+    active_pane: usize,
+}
+
 struct GhostStickiesApp {
     notes_markdown: String,
     notes_root: Option<PathBuf>,
     current_note_file: Option<PathBuf>,
     note_status: String,
+    editing_notes: bool,
     theme: ThemePreset,
     minimized: bool,
     sidebar_open: bool,
@@ -77,11 +98,17 @@ struct GhostStickiesApp {
     startup_tasks_run: bool,
     applied_privacy_mode: Option<bool>,
     next_tab_number: usize,
+    next_pane_uid: u64,
     terminal_tabs: Vec<TerminalTab>,
     active_terminal: usize,
     renaming_tab: Option<usize>,
     rename_buffer: String,
+    // Debug log
+    debug_log: VecDeque<String>,
+    show_debug: bool,
 }
+
+const DEBUG_LOG_MAX: usize = 200;
 
 #[derive(Serialize, Deserialize, Default)]
 struct AppConfig {
@@ -92,88 +119,118 @@ struct AppConfig {
 
 #[derive(Clone, Copy)]
 enum AppSymbol {
-    Quit,
-    Minimize,
     Privacy,
-    NotesBack,
-    NotesForward,
 }
 
 impl Default for ThemePreset {
     fn default() -> Self {
-        Self::Black
+        Self::Warp
     }
 }
 
 impl ThemePreset {
-    const ALL: [Self; 4] = [Self::Terminal, Self::Black, Self::Blue, Self::Red];
+    const ALL: [Self; 4] = [Self::Warp, Self::WarpLight, Self::Terminal, Self::Midnight];
 
     fn label(self) -> &'static str {
         match self {
+            Self::Warp => "Warp Dark",
+            Self::WarpLight => "Warp Blue",
             Self::Terminal => "Terminal",
-            Self::Black => "Black",
-            Self::Blue => "Blue",
-            Self::Red => "Red",
+            Self::Midnight => "Midnight",
         }
     }
 
     fn palette(self) -> ThemePalette {
         match self {
-            Self::Terminal => ThemePalette {
-                bg: egui::Color32::from_rgba_premultiplied(9, 13, 10, 214),
-                terminal_bg: egui::Color32::from_rgba_premultiplied(10, 13, 11, 242),
-                sidebar_bg: egui::Color32::from_rgba_premultiplied(16, 22, 18, 228),
-                sidebar_soft_bg: egui::Color32::from_rgba_premultiplied(20, 28, 23, 214),
-                bar_bg: egui::Color32::from_rgba_premultiplied(17, 22, 18, 240),
-                border: egui::Color32::from_rgba_premultiplied(90, 220, 150, 82),
-                text: egui::Color32::from_rgb(168, 255, 196),
-                muted_text: egui::Color32::from_rgb(108, 170, 126),
-                selection: egui::Color32::from_rgba_premultiplied(44, 104, 70, 150),
+            Self::Warp => ThemePalette {
+                bg: egui::Color32::from_rgb(20, 20, 28),
+                terminal_bg: egui::Color32::from_rgb(17, 17, 24),
+                sidebar_bg: egui::Color32::from_rgb(24, 24, 33),
+                sidebar_soft_bg: egui::Color32::from_rgb(30, 30, 40),
+                bar_bg: egui::Color32::from_rgb(26, 26, 36),
+                border: egui::Color32::from_rgba_premultiplied(255, 255, 255, 8),
+                text: egui::Color32::from_rgb(229, 229, 236),
+                muted_text: egui::Color32::from_rgb(110, 110, 128),
+                selection: egui::Color32::from_rgba_premultiplied(60, 80, 140, 140),
+                accent: egui::Color32::from_rgb(82, 182, 154),
+                accent_dim: egui::Color32::from_rgb(55, 120, 100),
+                tab_bg: egui::Color32::from_rgb(32, 32, 44),
+                active_tab_bg: egui::Color32::from_rgb(48, 48, 64),
+                tab_text: egui::Color32::from_rgb(140, 140, 158),
+                active_tab_text: egui::Color32::from_rgb(229, 229, 236),
+                input_bg: egui::Color32::from_rgb(28, 28, 38),
+                surface: egui::Color32::from_rgb(34, 34, 46),
             },
-            Self::Black => ThemePalette {
-                bg: egui::Color32::from_rgba_premultiplied(18, 18, 20, 224),
-                terminal_bg: egui::Color32::from_rgba_premultiplied(15, 15, 17, 244),
-                sidebar_bg: egui::Color32::from_rgba_premultiplied(24, 24, 28, 232),
-                sidebar_soft_bg: egui::Color32::from_rgba_premultiplied(30, 30, 34, 216),
-                bar_bg: egui::Color32::from_rgba_premultiplied(24, 24, 28, 244),
-                border: egui::Color32::from_rgba_premultiplied(230, 230, 236, 66),
-                text: egui::Color32::from_rgb(242, 242, 246),
-                muted_text: egui::Color32::from_rgb(160, 160, 168),
-                selection: egui::Color32::from_rgba_premultiplied(100, 110, 130, 130),
-            },
-            Self::Blue => ThemePalette {
-                bg: egui::Color32::from_rgba_premultiplied(14, 24, 42, 224),
-                terminal_bg: egui::Color32::from_rgba_premultiplied(13, 18, 34, 244),
-                sidebar_bg: egui::Color32::from_rgba_premultiplied(20, 32, 54, 232),
-                sidebar_soft_bg: egui::Color32::from_rgba_premultiplied(28, 42, 68, 218),
-                bar_bg: egui::Color32::from_rgba_premultiplied(20, 30, 50, 244),
-                border: egui::Color32::from_rgba_premultiplied(120, 175, 255, 84),
+            Self::WarpLight => ThemePalette {
+                bg: egui::Color32::from_rgb(14, 24, 42),
+                terminal_bg: egui::Color32::from_rgb(12, 20, 36),
+                sidebar_bg: egui::Color32::from_rgb(18, 30, 52),
+                sidebar_soft_bg: egui::Color32::from_rgb(24, 38, 64),
+                bar_bg: egui::Color32::from_rgb(20, 32, 54),
+                border: egui::Color32::from_rgba_premultiplied(120, 175, 255, 18),
                 text: egui::Color32::from_rgb(215, 234, 255),
-                muted_text: egui::Color32::from_rgb(143, 173, 214),
+                muted_text: egui::Color32::from_rgb(100, 140, 190),
                 selection: egui::Color32::from_rgba_premultiplied(66, 110, 185, 148),
+                accent: egui::Color32::from_rgb(100, 200, 255),
+                accent_dim: egui::Color32::from_rgb(60, 130, 180),
+                tab_bg: egui::Color32::from_rgb(24, 38, 60),
+                active_tab_bg: egui::Color32::from_rgb(36, 52, 80),
+                tab_text: egui::Color32::from_rgb(120, 160, 210),
+                active_tab_text: egui::Color32::from_rgb(215, 234, 255),
+                input_bg: egui::Color32::from_rgb(16, 26, 46),
+                surface: egui::Color32::from_rgb(26, 40, 66),
             },
-            Self::Red => ThemePalette {
-                bg: egui::Color32::from_rgba_premultiplied(40, 14, 16, 224),
-                terminal_bg: egui::Color32::from_rgba_premultiplied(28, 10, 12, 244),
-                sidebar_bg: egui::Color32::from_rgba_premultiplied(48, 18, 20, 232),
-                sidebar_soft_bg: egui::Color32::from_rgba_premultiplied(58, 24, 26, 218),
-                bar_bg: egui::Color32::from_rgba_premultiplied(46, 18, 20, 244),
-                border: egui::Color32::from_rgba_premultiplied(255, 130, 130, 92),
-                text: egui::Color32::from_rgb(255, 220, 220),
-                muted_text: egui::Color32::from_rgb(208, 144, 144),
-                selection: egui::Color32::from_rgba_premultiplied(170, 70, 70, 148),
+            Self::Terminal => ThemePalette {
+                bg: egui::Color32::from_rgb(9, 13, 10),
+                terminal_bg: egui::Color32::from_rgb(10, 13, 11),
+                sidebar_bg: egui::Color32::from_rgb(16, 22, 18),
+                sidebar_soft_bg: egui::Color32::from_rgb(20, 28, 23),
+                bar_bg: egui::Color32::from_rgb(17, 22, 18),
+                border: egui::Color32::from_rgba_premultiplied(90, 220, 150, 20),
+                text: egui::Color32::from_rgb(168, 255, 196),
+                muted_text: egui::Color32::from_rgb(80, 130, 96),
+                selection: egui::Color32::from_rgba_premultiplied(44, 104, 70, 150),
+                accent: egui::Color32::from_rgb(90, 220, 150),
+                accent_dim: egui::Color32::from_rgb(50, 140, 90),
+                tab_bg: egui::Color32::from_rgb(14, 20, 16),
+                active_tab_bg: egui::Color32::from_rgb(24, 36, 28),
+                tab_text: egui::Color32::from_rgb(80, 130, 96),
+                active_tab_text: egui::Color32::from_rgb(168, 255, 196),
+                input_bg: egui::Color32::from_rgb(12, 16, 13),
+                surface: egui::Color32::from_rgb(22, 30, 24),
+            },
+            Self::Midnight => ThemePalette {
+                bg: egui::Color32::from_rgb(12, 12, 16),
+                terminal_bg: egui::Color32::from_rgb(8, 8, 12),
+                sidebar_bg: egui::Color32::from_rgb(16, 16, 22),
+                sidebar_soft_bg: egui::Color32::from_rgb(22, 22, 30),
+                bar_bg: egui::Color32::from_rgb(18, 18, 24),
+                border: egui::Color32::from_rgba_premultiplied(255, 255, 255, 6),
+                text: egui::Color32::from_rgb(220, 220, 228),
+                muted_text: egui::Color32::from_rgb(90, 90, 108),
+                selection: egui::Color32::from_rgba_premultiplied(80, 60, 140, 140),
+                accent: egui::Color32::from_rgb(200, 140, 255),
+                accent_dim: egui::Color32::from_rgb(130, 90, 180),
+                tab_bg: egui::Color32::from_rgb(20, 20, 28),
+                active_tab_bg: egui::Color32::from_rgb(34, 34, 46),
+                tab_text: egui::Color32::from_rgb(100, 100, 118),
+                active_tab_text: egui::Color32::from_rgb(220, 220, 228),
+                input_bg: egui::Color32::from_rgb(14, 14, 20),
+                surface: egui::Color32::from_rgb(24, 24, 34),
             },
         }
     }
 }
 
-impl TerminalTab {
-    fn new(number: usize, cwd: PathBuf) -> Self {
+// ── TerminalPane implementation ──
+
+impl TerminalPane {
+    fn new(uid: u64, cwd: PathBuf) -> Self {
         let rows = 28;
         let cols = 120;
 
         Self {
-            title: format!("Tab {number}"),
+            uid,
             cwd,
             parser: Parser::new(rows, cols, TERMINAL_SCROLLBACK),
             rx: None,
@@ -200,7 +257,7 @@ impl TerminalTab {
         {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_owned());
             let mut command = CommandBuilder::new(shell);
-            command.arg("-i");
+            command.arg("-il");
             command.cwd(self.cwd.as_os_str());
             command.env("TERM", "xterm-256color");
             command.env("COLORTERM", "truecolor");
@@ -350,6 +407,12 @@ impl TerminalTab {
             let _ = writer.write_all(bytes);
             let _ = writer.flush();
         }
+    }
+
+    fn send_text(&mut self, text: &str) {
+        self.selection = None;
+        self.set_scrollback(0);
+        self.write_bytes(text.as_bytes());
     }
 
     fn point_is_before(a: TerminalPoint, b: TerminalPoint) -> bool {
@@ -628,7 +691,7 @@ impl TerminalTab {
     }
 }
 
-impl Drop for TerminalTab {
+impl Drop for TerminalPane {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
@@ -636,15 +699,144 @@ impl Drop for TerminalTab {
     }
 }
 
+fn shell_escape_path(path: &Path) -> String {
+    let display = path.to_string_lossy();
+    let escaped = display.replace('\'', "'\\''");
+    format!("'{escaped}'")
+}
+
+// ── TerminalTab implementation ──
+
+impl TerminalTab {
+    fn new(number: usize, uid: u64, cwd: PathBuf) -> Self {
+        Self {
+            title: format!("Tab {number}"),
+            panes: vec![TerminalPane::new(uid, cwd)],
+            active_pane: 0,
+        }
+    }
+
+    fn active_pane(&self) -> &TerminalPane {
+        &self.panes[self.active_pane]
+    }
+
+    fn active_pane_mut(&mut self) -> &mut TerminalPane {
+        &mut self.panes[self.active_pane]
+    }
+
+    fn split_pane(&mut self, uid: u64) {
+        let cwd = self.panes[self.active_pane].cwd.clone();
+        let insert_at = self.active_pane + 1;
+        self.panes.insert(insert_at, TerminalPane::new(uid, cwd));
+        self.active_pane = insert_at;
+    }
+
+    fn close_active_pane(&mut self) -> bool {
+        if self.panes.len() <= 1 {
+            return false;
+        }
+        self.panes.remove(self.active_pane);
+        if self.active_pane >= self.panes.len() {
+            self.active_pane = self.panes.len() - 1;
+        }
+        true
+    }
+
+    fn focus_next_pane(&mut self) {
+        if self.panes.len() > 1 {
+            self.active_pane = (self.active_pane + 1) % self.panes.len();
+        }
+    }
+
+    fn focus_prev_pane(&mut self) {
+        if self.panes.len() > 1 {
+            self.active_pane = if self.active_pane == 0 {
+                self.panes.len() - 1
+            } else {
+                self.active_pane - 1
+            };
+        }
+    }
+
+    fn ensure_all_started(&mut self) {
+        for pane in &mut self.panes {
+            pane.ensure_started();
+        }
+    }
+
+    fn drain_all_output(&mut self) -> bool {
+        let mut any = false;
+        for pane in &mut self.panes {
+            if pane.drain_output() {
+                any = true;
+            }
+        }
+        any
+    }
+}
+
+fn default_terminal_cwd() -> PathBuf {
+    let home_dir = std::env::var_os("HOME").map(PathBuf::from);
+
+    let current_dir = std::env::current_dir().ok();
+    if let Some(dir) = current_dir {
+        let launched_from_bundle = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|parent| parent == dir))
+            .unwrap_or(false);
+
+        if dir != PathBuf::from("/") && !launched_from_bundle {
+            return dir;
+        }
+    }
+
+    home_dir.unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn display_path_short(path: &Path) -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        let home_path = PathBuf::from(&home);
+        if let Ok(relative) = path.strip_prefix(&home_path) {
+            return format!("~/{}", relative.display());
+        }
+    }
+    path.display().to_string()
+}
+
+fn git_branch(dir: &Path) -> Option<String> {
+    let head_file = dir.join(".git").join("HEAD");
+    let contents = fs::read_to_string(head_file).ok()?;
+    let trimmed = contents.trim();
+    if let Some(branch) = trimmed.strip_prefix("ref: refs/heads/") {
+        Some(branch.to_owned())
+    } else {
+        Some(trimmed[..8.min(trimmed.len())].to_owned())
+    }
+}
+
+fn git_repo_name(dir: &Path) -> Option<String> {
+    let mut current = dir;
+    loop {
+        if current.join(".git").exists() {
+            return current
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_owned());
+        }
+        current = current.parent()?;
+    }
+}
+
 impl Default for GhostStickiesApp {
     fn default() -> Self {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let cwd = default_terminal_cwd();
 
         Self {
             notes_markdown: "# TODO\n- [ ] Keep this shell usable for Codex CLI\n- [ ] Add quick project tabs\n- [ ] Save notes between sessions\n\n## Notes\nWrite markdown on the left.\nUse the right side like a real terminal.".to_owned(),
             notes_root: None,
             current_note_file: None,
-            note_status: "Set your StickyTerminal notes folder to start saving notes.".to_owned(),
+            note_status: "Set your notes folder to start saving notes.".to_owned(),
+            editing_notes: false,
             theme: ThemePreset::default(),
             minimized: false,
             sidebar_open: false,
@@ -652,10 +844,13 @@ impl Default for GhostStickiesApp {
             startup_tasks_run: false,
             applied_privacy_mode: None,
             next_tab_number: 2,
-            terminal_tabs: vec![TerminalTab::new(1, cwd)],
+            next_pane_uid: 2,
+            terminal_tabs: vec![TerminalTab::new(1, 1, cwd)],
             active_terminal: 0,
             renaming_tab: None,
             rename_buffer: String::new(),
+            debug_log: VecDeque::new(),
+            show_debug: false,
         }
     }
 }
@@ -663,6 +858,9 @@ impl Default for GhostStickiesApp {
 impl GhostStickiesApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        let fonts = egui::FontDefinitions::default();
+        cc.egui_ctx.set_fonts(fonts);
+
         let mut app = Self::default();
         app.load_saved_config();
         app
@@ -670,13 +868,7 @@ impl GhostStickiesApp {
 
     fn symbol_image(symbol: AppSymbol) -> egui::Image<'static> {
         let image = match symbol {
-            AppSymbol::Quit => egui::include_image!("../assets/x.square.fill.png"),
-            AppSymbol::Minimize => {
-                egui::include_image!("../assets/arrow.down.right.and.arrow.up.left.png")
-            }
             AppSymbol::Privacy => egui::include_image!("../assets/eye.circle.png"),
-            AppSymbol::NotesBack => egui::include_image!("../assets/arrow.backward.png"),
-            AppSymbol::NotesForward => egui::include_image!("../assets/arrow.right.png"),
         };
 
         egui::Image::new(image).fit_to_exact_size(egui::vec2(14.0, 14.0))
@@ -815,7 +1007,7 @@ impl GhostStickiesApp {
 
     fn choose_existing_note(&mut self) {
         let Some(root) = self.notes_root.clone() else {
-            self.note_status = "Choose your StickyTerminal folder first.".to_owned();
+            self.note_status = "Choose your notes folder first.".to_owned();
             return;
         };
 
@@ -828,7 +1020,7 @@ impl GhostStickiesApp {
         };
 
         if !file.starts_with(&root) {
-            self.note_status = "Pick a note inside your StickyTerminal folder.".to_owned();
+            self.note_status = "Pick a note inside your notes folder.".to_owned();
             return;
         }
 
@@ -838,7 +1030,7 @@ impl GhostStickiesApp {
 
     fn save_current_note(&mut self) {
         let Some(path) = self.note_file_path() else {
-            self.note_status = "Choose your StickyTerminal folder and a note first.".to_owned();
+            self.note_status = "Choose your notes folder and a note first.".to_owned();
             return;
         };
 
@@ -885,7 +1077,7 @@ impl GhostStickiesApp {
 
     fn create_new_note(&mut self) {
         let Some(root) = self.notes_root.clone() else {
-            self.note_status = "Choose your StickyTerminal folder first.".to_owned();
+            self.note_status = "Choose your notes folder first.".to_owned();
             return;
         };
 
@@ -899,7 +1091,7 @@ impl GhostStickiesApp {
         };
 
         if !path.starts_with(&root) {
-            self.note_status = "Save the note inside your StickyTerminal folder.".to_owned();
+            self.note_status = "Save the note inside your notes folder.".to_owned();
             return;
         }
 
@@ -915,10 +1107,220 @@ impl GhostStickiesApp {
 
     fn note_surface_frame(palette: ThemePalette) -> egui::Frame {
         egui::Frame::NONE
-            .fill(palette.sidebar_soft_bg)
-            .stroke(egui::Stroke::new(1.0, palette.border))
-            .corner_radius(egui::CornerRadius::same(12))
+            .fill(palette.surface)
+            .corner_radius(egui::CornerRadius::same(8))
             .inner_margin(egui::Margin::same(10))
+    }
+
+    /// Calculate indent level from leading whitespace (each 2 spaces or 1 tab = 1 level)
+    fn indent_level(line: &str) -> usize {
+        let leading: usize = line
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .map(|c| if c == '\t' { 2 } else { 1 })
+            .sum();
+        leading / 2
+    }
+
+    fn render_markdown_preview(
+        ui: &mut egui::Ui,
+        markdown: &mut String,
+        palette: ThemePalette,
+        available_height: f32,
+    ) -> bool {
+        let mut changed = false;
+        let indent_px = 16.0; // pixels per indent level
+
+        egui::ScrollArea::vertical()
+            .max_height(available_height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                let wrap_width = ui.available_width();
+
+                let lines: Vec<String> = markdown.lines().map(|s| s.to_owned()).collect();
+                let mut line_idx = 0;
+
+                while line_idx < lines.len() {
+                    let line = &lines[line_idx];
+                    let trimmed = line.trim();
+                    let indent = Self::indent_level(line);
+                    let left_margin = indent as f32 * indent_px;
+
+                    if trimmed.is_empty() {
+                        ui.add_space(6.0);
+                        line_idx += 1;
+                        continue;
+                    }
+
+                    // Headings (no indent)
+                    if let Some(heading) = trimmed.strip_prefix("### ") {
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(heading)
+                                    .size(14.0)
+                                    .strong()
+                                    .color(palette.text),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Wrap),
+                        );
+                        ui.add_space(2.0);
+                    } else if let Some(heading) = trimmed.strip_prefix("## ") {
+                        ui.add_space(6.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(heading)
+                                    .size(16.0)
+                                    .strong()
+                                    .color(palette.text),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Wrap),
+                        );
+                        ui.add_space(3.0);
+                    } else if let Some(heading) = trimmed.strip_prefix("# ") {
+                        ui.add_space(8.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(heading)
+                                    .size(20.0)
+                                    .strong()
+                                    .color(palette.text),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Wrap),
+                        );
+                        ui.add_space(4.0);
+                    }
+                    // Checked checkbox
+                    else if trimmed.starts_with("- [x] ") || trimmed.starts_with("- [X] ") {
+                        let task_text = &trimmed[6..];
+                        ui.horizontal_wrapped(|ui| {
+                            if left_margin > 0.0 {
+                                ui.add_space(left_margin);
+                            }
+                            let mut checked = true;
+                            if ui.checkbox(&mut checked, "").changed() {
+                                Self::toggle_line_checkbox(markdown, line_idx, false);
+                                changed = true;
+                            }
+                            let text_width = (wrap_width - left_margin - 28.0).max(40.0);
+                            ui.add_sized(
+                                [text_width, 0.0],
+                                egui::Label::new(
+                                    egui::RichText::new(task_text)
+                                        .strikethrough()
+                                        .color(palette.muted_text),
+                                )
+                                .wrap_mode(egui::TextWrapMode::Wrap),
+                            );
+                        });
+                    }
+                    // Unchecked checkbox
+                    else if trimmed.starts_with("- [ ] ") {
+                        let task_text = &trimmed[6..];
+                        ui.horizontal_wrapped(|ui| {
+                            if left_margin > 0.0 {
+                                ui.add_space(left_margin);
+                            }
+                            let mut checked = false;
+                            if ui.checkbox(&mut checked, "").changed() {
+                                Self::toggle_line_checkbox(markdown, line_idx, true);
+                                changed = true;
+                            }
+                            let text_width = (wrap_width - left_margin - 28.0).max(40.0);
+                            ui.add_sized(
+                                [text_width, 0.0],
+                                egui::Label::new(
+                                    egui::RichText::new(task_text).color(palette.text),
+                                )
+                                .wrap_mode(egui::TextWrapMode::Wrap),
+                            );
+                        });
+                    }
+                    // Bullet point
+                    else if let Some(bullet_text) = trimmed.strip_prefix("- ") {
+                        ui.horizontal_wrapped(|ui| {
+                            if left_margin > 0.0 {
+                                ui.add_space(left_margin);
+                            }
+                            ui.label(egui::RichText::new("\u{2022}").color(palette.accent));
+                            let text_width = (wrap_width - left_margin - 16.0).max(40.0);
+                            ui.add_sized(
+                                [text_width, 0.0],
+                                egui::Label::new(
+                                    egui::RichText::new(Self::render_inline_markdown(bullet_text))
+                                        .color(palette.text),
+                                )
+                                .wrap_mode(egui::TextWrapMode::Wrap),
+                            );
+                        });
+                    }
+                    // Horizontal rule
+                    else if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                    }
+                    // Regular text
+                    else {
+                        if left_margin > 0.0 {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.add_space(left_margin);
+                                let text_width = (wrap_width - left_margin).max(40.0);
+                                ui.add_sized(
+                                    [text_width, 0.0],
+                                    egui::Label::new(
+                                        egui::RichText::new(Self::render_inline_markdown(trimmed))
+                                            .color(palette.text),
+                                    )
+                                    .wrap_mode(egui::TextWrapMode::Wrap),
+                                );
+                            });
+                        } else {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(Self::render_inline_markdown(trimmed))
+                                        .color(palette.text),
+                                )
+                                .wrap_mode(egui::TextWrapMode::Wrap),
+                            );
+                        }
+                    }
+
+                    line_idx += 1;
+                }
+            });
+
+        changed
+    }
+
+    fn render_inline_markdown(text: &str) -> String {
+        text.replace("**", "").replace('*', "")
+    }
+
+    fn toggle_line_checkbox(markdown: &mut String, line_index: usize, checked: bool) {
+        let mut lines: Vec<String> = markdown.lines().map(|s| s.to_owned()).collect();
+        if line_index < lines.len() {
+            if checked {
+                lines[line_index] = lines[line_index].replacen("- [ ] ", "- [x] ", 1);
+            } else {
+                let line = &lines[line_index];
+                if line.contains("- [x] ") {
+                    lines[line_index] = line.replacen("- [x] ", "- [ ] ", 1);
+                } else if line.contains("- [X] ") {
+                    lines[line_index] = line.replacen("- [X] ", "- [ ] ", 1);
+                }
+            }
+            *markdown = lines.join("\n");
+        }
+    }
+
+    fn insert_checkbox_line(markdown: &mut String) {
+        if markdown.ends_with('\n') || markdown.is_empty() {
+            markdown.push_str("- [ ] ");
+        } else {
+            markdown.push_str("\n- [ ] ");
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -942,7 +1344,6 @@ impl GhostStickiesApp {
                     continue;
                 }
 
-                // NSWindowSharingNone = 0, NSWindowSharingReadOnly = 1.
                 let sharing_type = if enabled { 0isize } else { 1isize };
                 let _: () = msg_send![window, setSharingType: sharing_type];
             }
@@ -951,6 +1352,25 @@ impl GhostStickiesApp {
 
     #[cfg(not(target_os = "macos"))]
     fn apply_macos_share_privacy(&self, _enabled: bool) {}
+
+    #[cfg(target_os = "macos")]
+    fn toggle_fullscreen() {
+        unsafe {
+            let ns_app_class = class!(NSApplication);
+            let app: *mut Object = msg_send![ns_app_class, sharedApplication];
+            if app.is_null() {
+                return;
+            }
+            let key_window: *mut Object = msg_send![app, keyWindow];
+            if key_window.is_null() {
+                return;
+            }
+            let _: () = msg_send![key_window, toggleFullScreen: std::ptr::null::<Object>()];
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn toggle_fullscreen() {}
 
     fn apply_window_mode(&mut self, ctx: &egui::Context) {
         if self.applied_privacy_mode == Some(self.privacy_mode) {
@@ -974,14 +1394,30 @@ impl GhostStickiesApp {
         &mut self.terminal_tabs[self.active_terminal]
     }
 
+    fn alloc_pane_uid(&mut self) -> u64 {
+        let uid = self.next_pane_uid;
+        self.next_pane_uid += 1;
+        uid
+    }
+
+    fn log_debug(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        self.debug_log.push_back(msg);
+        if self.debug_log.len() > DEBUG_LOG_MAX {
+            self.debug_log.pop_front();
+        }
+    }
+
     fn add_terminal_tab(&mut self) {
-        let cwd = self.active_tab().cwd.clone();
+        let cwd = self.active_tab().active_pane().cwd.clone();
         let number = self.next_tab_number;
         self.next_tab_number += 1;
-        self.terminal_tabs.push(TerminalTab::new(number, cwd));
+        let uid = self.alloc_pane_uid();
+        self.terminal_tabs.push(TerminalTab::new(number, uid, cwd));
         self.active_terminal = self.terminal_tabs.len().saturating_sub(1);
         self.renaming_tab = None;
         self.rename_buffer.clear();
+        self.log_debug(format!("add_terminal_tab: tab={number} pane_uid={uid}"));
     }
 
     fn switch_terminal_tab(&mut self, index: usize) {
@@ -1120,19 +1556,27 @@ impl GhostStickiesApp {
         }
     }
 
-    fn render_terminal(&mut self, ui: &mut egui::Ui, palette: ThemePalette, ctx: &egui::Context) {
+    /// Render a single terminal pane
+    fn render_pane(
+        pane: &mut TerminalPane,
+        ui: &mut egui::Ui,
+        palette: ThemePalette,
+        ctx: &egui::Context,
+        pane_id: egui::Id,
+        is_active: bool,
+    ) {
         let frame = egui::Frame::NONE
             .fill(palette.terminal_bg)
-            .stroke(egui::Stroke::new(1.0, palette.border))
-            .corner_radius(egui::CornerRadius::same(12))
-            .inner_margin(egui::Margin::same(12));
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::same(6));
 
         frame.show(ui, |ui| {
-            let terminal_id =
-                ui.make_persistent_id(("live_terminal_surface", self.active_terminal));
+            let terminal_id = pane_id.with("terminal_surface");
             let size = ui.available_size();
             let (rect, _response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
             let response = ui.interact(rect, terminal_id, egui::Sense::click_and_drag());
+            let hovered_files = ctx.input(|input| input.raw.hovered_files.clone());
+            let dropped_files = ctx.input(|input| input.raw.dropped_files.clone());
 
             let font_id = egui::TextStyle::Monospace.resolve(ui.style());
             let measure =
@@ -1145,76 +1589,93 @@ impl GhostStickiesApp {
             let rows = ((rect.height() - inner_padding * 2.0) / row_height).floor() as u16;
             let cols = ((rect.width() - inner_padding * 2.0) / char_width).floor() as u16;
 
-            {
-                let tab = self.active_tab_mut();
-                tab.resize(rows, cols);
+            pane.resize(rows, cols);
 
-                if response.clicked() {
-                    response.request_focus();
-                    tab.selection = None;
-                }
-
-                if response.drag_started() {
-                    response.request_focus();
-                    if let Some(pointer_pos) = response.interact_pointer_pos() {
-                        let point = tab.cell_from_pos(
-                            rect,
-                            pointer_pos,
-                            char_width,
-                            row_height,
-                            inner_padding,
-                        );
-                        tab.selection = Some((point, point));
-                    }
-                }
-
-                if response.dragged() {
-                    if let Some(pointer_pos) = response.interact_pointer_pos() {
-                        let point = tab.cell_from_pos(
-                            rect,
-                            pointer_pos,
-                            char_width,
-                            row_height,
-                            inner_padding,
-                        );
-                        if let Some((anchor, _)) = tab.selection {
-                            tab.selection = Some((anchor, point));
-                        }
-                    }
-                }
-
-                if response.hovered() {
-                    let scroll_delta = ctx.input(|input| input.smooth_scroll_delta.y);
-                    if scroll_delta.abs() > f32::EPSILON {
-                        let rows_delta = (scroll_delta / row_height).round() as i32;
-                        if rows_delta != 0 {
-                            tab.adjust_scrollback(rows_delta);
-                        }
-                    }
-                }
-
-                tab.has_focus = ui.memory(|memory| memory.has_focus(terminal_id));
-                if tab.has_focus {
-                    ui.memory_mut(|memory| {
-                        memory.set_focus_lock_filter(
-                            terminal_id,
-                            egui::EventFilter {
-                                tab: true,
-                                horizontal_arrows: true,
-                                vertical_arrows: true,
-                                escape: true,
-                            },
-                        );
-                    });
-                }
-                tab.handle_input(ctx);
+            if response.clicked() {
+                response.request_focus();
+                pane.selection = None;
             }
 
+            if response.drag_started() {
+                response.request_focus();
+                if let Some(pointer_pos) = response.interact_pointer_pos() {
+                    let point =
+                        pane.cell_from_pos(rect, pointer_pos, char_width, row_height, inner_padding);
+                    pane.selection = Some((point, point));
+                }
+            }
+
+            if response.dragged() {
+                if let Some(pointer_pos) = response.interact_pointer_pos() {
+                    let point =
+                        pane.cell_from_pos(rect, pointer_pos, char_width, row_height, inner_padding);
+                    if let Some((anchor, _)) = pane.selection {
+                        pane.selection = Some((anchor, point));
+                    }
+                }
+            }
+
+            if response.hovered() {
+                let scroll_delta = ctx.input(|input| input.smooth_scroll_delta.y);
+                if scroll_delta.abs() > f32::EPSILON {
+                    let rows_delta = (scroll_delta / row_height).round() as i32;
+                    if rows_delta != 0 {
+                        pane.adjust_scrollback(rows_delta);
+                    }
+                }
+            }
+
+            if response.hovered() && !dropped_files.is_empty() {
+                let dropped_paths = dropped_files
+                    .iter()
+                    .filter_map(|file| {
+                        file.path
+                            .as_ref()
+                            .map(|path| shell_escape_path(path))
+                            .or_else(|| {
+                                (!file.name.is_empty())
+                                    .then(|| shell_escape_path(Path::new(&file.name)))
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                if !dropped_paths.is_empty() {
+                    response.request_focus();
+                    pane.send_text(&(dropped_paths.join(" ") + " "));
+                }
+            }
+
+            pane.has_focus = ui.memory(|memory| memory.has_focus(terminal_id));
+            if pane.has_focus {
+                ui.memory_mut(|memory| {
+                    memory.set_focus_lock_filter(
+                        terminal_id,
+                        egui::EventFilter {
+                            tab: true,
+                            horizontal_arrows: true,
+                            vertical_arrows: true,
+                            escape: true,
+                        },
+                    );
+                });
+            }
+            pane.handle_input(ctx);
+
             let painter = ui.painter_at(rect);
-            let tab = self.active_tab();
-            let screen = tab.parser.screen();
-            for row in 0..tab.rows {
-                for col in 0..tab.cols {
+
+            // Draw a subtle active-pane indicator
+            if is_active {
+                painter.rect(
+                    rect.shrink(0.5),
+                    egui::CornerRadius::same(6),
+                    egui::Color32::TRANSPARENT,
+                    egui::Stroke::new(1.0, palette.accent.linear_multiply(0.3)),
+                    egui::StrokeKind::Inside,
+                );
+            }
+
+            let screen = pane.parser.screen();
+            for row in 0..pane.rows {
+                for col in 0..pane.cols {
                     let Some(cell) = screen.cell(row, col) else {
                         continue;
                     };
@@ -1224,7 +1685,8 @@ impl GhostStickiesApp {
                     }
 
                     let mut fg = Self::resolve_terminal_color(cell.fgcolor(), palette.text);
-                    let mut bg = Self::resolve_terminal_color(cell.bgcolor(), palette.terminal_bg);
+                    let mut bg =
+                        Self::resolve_terminal_color(cell.bgcolor(), palette.terminal_bg);
 
                     if cell.inverse() {
                         std::mem::swap(&mut fg, &mut bg);
@@ -1252,8 +1714,12 @@ impl GhostStickiesApp {
                         painter.rect_filled(cell_rect, egui::CornerRadius::ZERO, bg);
                     }
 
-                    if tab.cell_selected(row, col) {
-                        painter.rect_filled(cell_rect, egui::CornerRadius::ZERO, palette.selection);
+                    if pane.cell_selected(row, col) {
+                        painter.rect_filled(
+                            cell_rect,
+                            egui::CornerRadius::ZERO,
+                            palette.selection,
+                        );
                     }
 
                     if !cell.has_contents() {
@@ -1281,24 +1747,352 @@ impl GhostStickiesApp {
             }
 
             let (cursor_row, cursor_col) = screen.cursor_position();
-            if tab.has_focus {
+            if pane.has_focus {
                 let x = rect.left() + inner_padding + cursor_col as f32 * char_width;
                 let y = rect.top() + inner_padding + cursor_row as f32 * row_height;
                 let cursor_rect = egui::Rect::from_min_size(
                     egui::pos2(x, y),
                     egui::vec2(2.0, (row_height - 2.0).max(12.0)),
                 );
-                painter.rect_filled(cursor_rect, egui::CornerRadius::same(1), palette.text);
+                painter.rect_filled(cursor_rect, egui::CornerRadius::same(1), palette.accent);
             } else {
                 painter.text(
                     rect.right_top() + egui::vec2(-10.0, 6.0),
                     egui::Align2::RIGHT_TOP,
-                    "click to type",
+                    "click to focus",
                     egui::TextStyle::Small.resolve(ui.style()),
                     palette.muted_text,
                 );
             }
+
+            if response.hovered() && !hovered_files.is_empty() {
+                painter.rect_filled(
+                    rect,
+                    egui::CornerRadius::same(8),
+                    palette.selection.linear_multiply(0.3),
+                );
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Drop files or folders to paste their paths",
+                    egui::TextStyle::Button.resolve(ui.style()),
+                    palette.text,
+                );
+            }
         });
+    }
+
+    /// Compute grid dimensions for n panes
+    fn grid_dims(n: usize) -> (usize, usize) {
+        match n {
+            0 | 1 => (1, 1),
+            2 => (2, 1),
+            3 => (3, 1),
+            4 => (2, 2),
+            5 | 6 => (3, 2),
+            7..=9 => (3, 3),
+            10..=12 => (4, 3),
+            _ => {
+                let cols = (n as f32).sqrt().ceil() as usize;
+                let rows = (n + cols - 1) / cols;
+                (cols, rows)
+            }
+        }
+    }
+
+    /// Render all panes in an auto-grid layout with drag-to-swap
+    fn render_panes(&mut self, ui: &mut egui::Ui, palette: ThemePalette, ctx: &egui::Context) {
+        let tab_idx = self.active_terminal;
+        let num_panes = self.terminal_tabs[tab_idx].panes.len();
+        let active_pane_idx = self.terminal_tabs[tab_idx].active_pane;
+
+        if num_panes == 1 {
+            let pane_uid = self.terminal_tabs[tab_idx].panes[0].uid;
+            let pane_id = ui.id().with(("pane_uid", pane_uid));
+            let pane = &mut self.terminal_tabs[tab_idx].panes[0];
+            Self::render_pane(pane, ui, palette, ctx, pane_id, true);
+            return;
+        }
+
+        let (cols, rows) = Self::grid_dims(num_panes);
+        let total_width = ui.available_width();
+        let total_height = ui.available_height();
+        let gap = PANE_SEPARATOR_WIDTH;
+        let pane_width = (total_width - gap * (cols as f32 - 1.0)) / cols as f32;
+        let pane_height = (total_height - gap * (rows as f32 - 1.0)) / rows as f32;
+
+        // Collect rects for each pane slot to detect drag targets
+        let mut pane_rects: Vec<egui::Rect> = Vec::with_capacity(num_panes);
+        let origin = ui.cursor().min;
+
+        for idx in 0..num_panes {
+            let col = idx % cols;
+            let row = idx / cols;
+            let x = origin.x + col as f32 * (pane_width + gap);
+            let y = origin.y + row as f32 * (pane_height + gap);
+            pane_rects.push(egui::Rect::from_min_size(
+                egui::pos2(x, y),
+                egui::vec2(pane_width, pane_height),
+            ));
+        }
+
+        // Draw separators
+        let painter = ui.painter();
+        for row in 0..rows {
+            let panes_in_row = if (row + 1) * cols <= num_panes {
+                cols
+            } else {
+                num_panes - row * cols
+            };
+
+            // Vertical separators between columns
+            for col in 1..panes_in_row {
+                let x = origin.x + col as f32 * (pane_width + gap) - gap;
+                let y_top = origin.y + row as f32 * (pane_height + gap);
+                let sep_rect = egui::Rect::from_min_size(
+                    egui::pos2(x, y_top),
+                    egui::vec2(gap, pane_height),
+                );
+                painter.rect_filled(sep_rect, egui::CornerRadius::ZERO, palette.border);
+            }
+
+            // Horizontal separator below this row (if not last row)
+            if row + 1 < rows {
+                let y = origin.y + (row + 1) as f32 * (pane_height + gap) - gap;
+                let sep_rect = egui::Rect::from_min_size(
+                    egui::pos2(origin.x, y),
+                    egui::vec2(total_width, gap),
+                );
+                painter.rect_filled(sep_rect, egui::CornerRadius::ZERO, palette.border);
+            }
+        }
+
+        // Render each pane in its grid slot
+        let mut swap_target: Option<(usize, usize)> = None;
+
+        for pane_idx in 0..num_panes {
+            let rect = pane_rects[pane_idx];
+            let is_active = pane_idx == active_pane_idx;
+            let pane_uid = self.terminal_tabs[tab_idx].panes[pane_idx].uid;
+            let pane_id = ui.id().with(("pane_uid", pane_uid));
+
+            // Create a child UI constrained to this pane's rect
+            let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+            child_ui.set_clip_rect(rect);
+
+            let pane = &mut self.terminal_tabs[tab_idx].panes[pane_idx];
+            Self::render_pane(pane, &mut child_ui, palette, ctx, pane_id, is_active);
+
+            if pane.has_focus && !is_active {
+                let old_active = self.terminal_tabs[tab_idx].active_pane;
+                self.terminal_tabs[tab_idx].active_pane = pane_idx;
+                self.log_debug(format!(
+                    "focus_change: pane {old_active} -> {pane_idx} (uid={})",
+                    self.terminal_tabs[tab_idx].panes[pane_idx].uid
+                ));
+            }
+
+            // Drag-to-swap detection: if this pane is being dragged,
+            // check if pointer moved into another pane's rect
+            let drag_id = pane_id.with("drag_swap");
+            let drag_resp = ui.interact(rect, drag_id, egui::Sense::drag());
+
+            if drag_resp.drag_started() {
+                // Store which pane started dragging
+                ui.data_mut(|d| d.insert_temp(egui::Id::new("dragging_pane"), pane_idx));
+            }
+
+            if drag_resp.dragged() {
+                if let Some(pos) = drag_resp.interact_pointer_pos() {
+                    let dragging_from: Option<usize> =
+                        ui.data(|d| d.get_temp(egui::Id::new("dragging_pane")));
+                    if let Some(from) = dragging_from {
+                        // Find which pane rect the pointer is over
+                        for (target_idx, target_rect) in pane_rects.iter().enumerate() {
+                            if target_idx != from && target_rect.contains(pos) {
+                                swap_target = Some((from, target_idx));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if drag_resp.drag_stopped() {
+                ui.data_mut(|d| d.remove_by_type::<usize>());
+            }
+        }
+
+        // Reserve the full grid area so egui knows it's used
+        let grid_rect = egui::Rect::from_min_size(
+            origin,
+            egui::vec2(total_width, rows as f32 * (pane_height + gap) - gap),
+        );
+        ui.allocate_rect(grid_rect, egui::Sense::hover());
+
+        // Perform swap if drag landed on another pane
+        if let Some((from, to)) = swap_target {
+            let from_uid = self.terminal_tabs[tab_idx].panes[from].uid;
+            let to_uid = self.terminal_tabs[tab_idx].panes[to].uid;
+            self.terminal_tabs[tab_idx].panes.swap(from, to);
+            // Update active pane to follow the swap
+            let active = self.terminal_tabs[tab_idx].active_pane;
+            if active == from {
+                self.terminal_tabs[tab_idx].active_pane = to;
+            } else if active == to {
+                self.terminal_tabs[tab_idx].active_pane = from;
+            }
+            self.log_debug(format!(
+                "drag_swap: idx {from}(uid={from_uid}) <-> idx {to}(uid={to_uid}), active_pane={}",
+                self.terminal_tabs[tab_idx].active_pane
+            ));
+        }
+    }
+
+    /// Render the tab bar
+    fn render_tab_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        palette: ThemePalette,
+    ) -> (
+        Option<usize>,
+        Option<usize>,
+        Option<usize>,
+        Option<(usize, usize)>,
+    ) {
+        let mut switch_to = None;
+        let mut close_tab = None;
+        let mut rename_tab = None;
+        let mut move_tab = None;
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+
+            for index in 0..self.terminal_tabs.len() {
+                let selected = index == self.active_terminal;
+                let renaming = self.renaming_tab == Some(index);
+
+                if renaming {
+                    let response = ui.add_sized(
+                        [140.0, 28.0],
+                        egui::TextEdit::singleline(&mut self.rename_buffer)
+                            .clip_text(false)
+                            .desired_width(140.0),
+                    );
+
+                    if response.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                    {
+                        self.commit_tab_rename();
+                    }
+
+                    if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                        self.cancel_tab_rename();
+                    }
+
+                    response.request_focus();
+                    continue;
+                }
+
+                let (tab_fill, tab_text_color) = if selected {
+                    (palette.active_tab_bg, palette.active_tab_text)
+                } else {
+                    (egui::Color32::TRANSPARENT, palette.tab_text)
+                };
+
+                // Show pane count if > 1
+                let tab_label = {
+                    let pane_count = self.terminal_tabs[index].panes.len();
+                    if pane_count > 1 {
+                        format!("{} ({})", self.terminal_tabs[index].title, pane_count)
+                    } else {
+                        self.terminal_tabs[index].title.clone()
+                    }
+                };
+
+                let tab_frame = egui::Frame::NONE
+                    .fill(tab_fill)
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(12, 4));
+
+                let response = tab_frame
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(&tab_label)
+                                .size(12.5)
+                                .color(tab_text_color),
+                        );
+                    })
+                    .response;
+
+                let response = response.interact(egui::Sense::click_and_drag());
+
+                if response.clicked() {
+                    switch_to = Some(index);
+                }
+
+                response.context_menu(|ui| {
+                    if ui.button("Rename").clicked() {
+                        rename_tab = Some(index);
+                        ui.close();
+                    }
+
+                    if ui
+                        .add_enabled(
+                            self.terminal_tabs.len() > 1,
+                            egui::Button::new("Close"),
+                        )
+                        .clicked()
+                    {
+                        close_tab = Some(index);
+                        ui.close();
+                    }
+                });
+
+                if response.dragged() {
+                    if let Some(pointer_pos) = response.interact_pointer_pos() {
+                        if pointer_pos.x < response.rect.left() && index > 0 {
+                            move_tab = Some((index, index - 1));
+                        } else if pointer_pos.x > response.rect.right()
+                            && index + 1 < self.terminal_tabs.len()
+                        {
+                            move_tab = Some((index, index + 1));
+                        }
+                    }
+                }
+            }
+
+            ui.add_space(4.0);
+            let plus_btn = ui.add(
+                egui::Button::new(
+                    egui::RichText::new("+").size(16.0).color(palette.muted_text),
+                )
+                .frame(false)
+                .min_size(egui::vec2(28.0, 28.0)),
+            );
+            if plus_btn.clicked() {
+                self.add_terminal_tab();
+            }
+            plus_btn.on_hover_text("New tab (Cmd+T)");
+
+            // Show split hint
+            let tab = &self.terminal_tabs[self.active_terminal];
+            if tab.panes.len() > 1 {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "pane {}/{}",
+                            tab.active_pane + 1,
+                            tab.panes.len()
+                        ))
+                        .small()
+                        .color(palette.muted_text),
+                    );
+                });
+            }
+        });
+
+        (switch_to, close_tab, rename_tab, move_tab)
     }
 }
 
@@ -1312,10 +2106,50 @@ impl eframe::App for GhostStickiesApp {
 
         let open_new_tab =
             ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::T));
+        let insert_checkbox =
+            ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::L));
+        let split_pane =
+            ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::D));
+        let close_pane = ctx.input(|input| {
+            input.modifiers.command && input.modifiers.shift && input.key_pressed(egui::Key::D)
+        });
+        let next_pane = ctx.input(|input| {
+            input.modifiers.command && input.key_pressed(egui::Key::CloseBracket)
+        });
+        let prev_pane = ctx.input(|input| {
+            input.modifiers.command && input.key_pressed(egui::Key::OpenBracket)
+        });
+        // Cmd+Shift+Arrow to move/swap the active pane in the grid
+        let move_pane_left = ctx.input(|input| {
+            input.modifiers.command
+                && input.modifiers.shift
+                && input.key_pressed(egui::Key::ArrowLeft)
+        });
+        let move_pane_right = ctx.input(|input| {
+            input.modifiers.command
+                && input.modifiers.shift
+                && input.key_pressed(egui::Key::ArrowRight)
+        });
+        let move_pane_up = ctx.input(|input| {
+            input.modifiers.command
+                && input.modifiers.shift
+                && input.key_pressed(egui::Key::ArrowUp)
+        });
+        let move_pane_down = ctx.input(|input| {
+            input.modifiers.command
+                && input.modifiers.shift
+                && input.key_pressed(egui::Key::ArrowDown)
+        });
+        let toggle_debug = ctx.input(|input| {
+            input.modifiers.command
+                && input.modifiers.shift
+                && input.key_pressed(egui::Key::L)
+        });
+
         let mut received_output = false;
         for tab in &mut self.terminal_tabs {
-            tab.ensure_started();
-            if tab.drain_output() {
+            tab.ensure_all_started();
+            if tab.drain_all_output() {
                 received_output = true;
             }
         }
@@ -1328,22 +2162,97 @@ impl eframe::App for GhostStickiesApp {
             self.add_terminal_tab();
         }
 
+        if split_pane && !close_pane {
+            let uid = self.alloc_pane_uid();
+            self.active_tab_mut().split_pane(uid);
+            self.log_debug(format!("split_pane: new pane_uid={uid}, total_panes={}", self.active_tab().panes.len()));
+        }
+
+        if close_pane {
+            let before = self.active_tab().panes.len();
+            self.active_tab_mut().close_active_pane();
+            self.log_debug(format!("close_pane: {before} -> {} panes", self.active_tab().panes.len()));
+        }
+
+        if next_pane {
+            let before = self.active_tab().active_pane;
+            self.active_tab_mut().focus_next_pane();
+            let after = self.active_tab().active_pane;
+            self.log_debug(format!("focus_next_pane: {before} -> {after}"));
+        }
+
+        if prev_pane {
+            let before = self.active_tab().active_pane;
+            self.active_tab_mut().focus_prev_pane();
+            let after = self.active_tab().active_pane;
+            self.log_debug(format!("focus_prev_pane: {before} -> {after}"));
+        }
+
+        // Move active pane in the grid
+        let mut kbd_swap: Option<(usize, usize)> = None;
+        {
+            let tab = self.active_tab_mut();
+            let n = tab.panes.len();
+            if n > 1 {
+                let idx = tab.active_pane;
+                let (cols, _rows) = Self::grid_dims(n);
+
+                let swap_with = if move_pane_left && idx % cols > 0 {
+                    Some(idx - 1)
+                } else if move_pane_right && idx % cols < cols - 1 && idx + 1 < n {
+                    Some(idx + 1)
+                } else if move_pane_up && idx >= cols {
+                    Some(idx - cols)
+                } else if move_pane_down && idx + cols < n {
+                    Some(idx + cols)
+                } else {
+                    None
+                };
+
+                if let Some(target) = swap_with {
+                    tab.panes.swap(idx, target);
+                    tab.active_pane = target;
+                    kbd_swap = Some((idx, target));
+                }
+            }
+        }
+        if let Some((from, to)) = kbd_swap {
+            self.log_debug(format!("keyboard_swap_pane: {from} <-> {to}"));
+        }
+
+        if insert_checkbox && self.sidebar_open {
+            Self::insert_checkbox_line(&mut self.notes_markdown);
+            self.editing_notes = true;
+        }
+
+        if toggle_debug {
+            self.show_debug = !self.show_debug;
+            self.log_debug(format!("debug window toggled: {}", self.show_debug));
+        }
+
         let palette = self.theme.palette();
 
         let mut style = (*ctx.style()).clone();
         style.visuals.window_fill = palette.bg;
         style.visuals.panel_fill = palette.bg;
-        style.visuals.extreme_bg_color = palette.bg;
+        style.visuals.extreme_bg_color = palette.input_bg;
         style.visuals.selection.bg_fill = palette.selection;
-        style.visuals.widgets.active.bg_fill = palette.bar_bg;
-        style.visuals.widgets.hovered.bg_fill = palette.bar_bg;
-        style.visuals.widgets.inactive.bg_fill = palette.sidebar_bg;
-        style.visuals.widgets.noninteractive.bg_fill = palette.sidebar_bg;
+        style.visuals.widgets.active.bg_fill = palette.surface;
+        style.visuals.widgets.hovered.bg_fill = palette.surface;
+        style.visuals.widgets.inactive.bg_fill = palette.tab_bg;
+        style.visuals.widgets.noninteractive.bg_fill = palette.surface;
         style.visuals.widgets.active.fg_stroke.color = palette.text;
         style.visuals.widgets.hovered.fg_stroke.color = palette.text;
-        style.visuals.widgets.inactive.fg_stroke.color = palette.text;
+        style.visuals.widgets.inactive.fg_stroke.color = palette.tab_text;
+        style.visuals.widgets.active.weak_bg_fill = palette.surface;
+        style.visuals.widgets.hovered.weak_bg_fill = palette.surface;
+        style.visuals.widgets.inactive.weak_bg_fill = palette.tab_bg;
         style.visuals.override_text_color = Some(palette.text);
-        style.visuals.window_corner_radius = egui::CornerRadius::same(14);
+        style.visuals.window_corner_radius = egui::CornerRadius::same(12);
+        style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
+        style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
+        style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
+        style.visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(6);
         ctx.set_style(style);
 
         let mut start_drag = false;
@@ -1352,12 +2261,12 @@ impl eframe::App for GhostStickiesApp {
         let mut privacy_toggled = false;
         let mut theme_changed = None;
 
+        // ── Top bar ──
         egui::TopBottomPanel::top("top_bar")
             .exact_height(TOP_BAR_HEIGHT)
             .frame(
                 egui::Frame::NONE
                     .fill(palette.bar_bg)
-                    .stroke(egui::Stroke::new(1.0, palette.border))
                     .inner_margin(egui::Margin::symmetric(10, 6)),
             )
             .show(ctx, |ui| {
@@ -1371,13 +2280,33 @@ impl eframe::App for GhostStickiesApp {
                 }
 
                 ui.horizontal(|ui| {
-                    if Self::symbol_button(ui, AppSymbol::Quit, "Quit", false).clicked() {
+                    // Traffic light buttons
+                    let dot_size = egui::vec2(12.0, 12.0);
+
+                    let (close_rect, close_resp) =
+                        ui.allocate_exact_size(dot_size, egui::Sense::click());
+                    let close_color = if close_resp.hovered() {
+                        egui::Color32::from_rgb(255, 95, 86)
+                    } else {
+                        egui::Color32::from_rgb(255, 95, 86).linear_multiply(0.7)
+                    };
+                    ui.painter()
+                        .circle_filled(close_rect.center(), 6.0, close_color);
+                    if close_resp.clicked() {
                         quit_requested = true;
                     }
 
-                    if Self::symbol_button(ui, AppSymbol::Minimize, "Minimize", self.minimized)
-                        .clicked()
-                    {
+                    ui.add_space(4.0);
+                    let (min_rect, min_resp) =
+                        ui.allocate_exact_size(dot_size, egui::Sense::click());
+                    let min_color = if min_resp.hovered() {
+                        egui::Color32::from_rgb(255, 189, 46)
+                    } else {
+                        egui::Color32::from_rgb(255, 189, 46).linear_multiply(0.7)
+                    };
+                    ui.painter()
+                        .circle_filled(min_rect.center(), 6.0, min_color);
+                    if min_resp.clicked() {
                         self.minimized = !self.minimized;
                         let target_height = if self.minimized {
                             MINIMIZED_HEIGHT
@@ -1390,15 +2319,90 @@ impl eframe::App for GhostStickiesApp {
                         )));
                     }
 
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("StickyTerminal")
-                            .strong()
-                            .color(palette.text),
-                    );
+                    ui.add_space(4.0);
+                    let (max_rect, max_resp) =
+                        ui.allocate_exact_size(dot_size, egui::Sense::click());
+                    let max_color = if max_resp.hovered() {
+                        egui::Color32::from_rgb(39, 201, 63)
+                    } else {
+                        egui::Color32::from_rgb(39, 201, 63).linear_multiply(0.7)
+                    };
+                    ui.painter()
+                        .circle_filled(max_rect.center(), 6.0, max_color);
+                    if max_resp.clicked() {
+                        Self::toggle_fullscreen();
+                    }
+
+                    ui.add_space(16.0);
+
+                    // Sidebar toggle
+                    let sidebar_icon_color = if self.sidebar_open {
+                        palette.accent
+                    } else {
+                        palette.muted_text
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("|||").size(11.0).color(sidebar_icon_color),
+                            )
+                            .frame(false),
+                        )
+                        .on_hover_text(if self.sidebar_open {
+                            "Hide sidebar"
+                        } else {
+                            "Show sidebar"
+                        })
+                        .clicked()
+                    {
+                        self.sidebar_open = !self.sidebar_open;
+                    }
+
+                    ui.add_space(12.0);
+
+                    // Git / path info
+                    let cwd = &self.active_tab().active_pane().cwd;
+                    let short_path = display_path_short(cwd);
+                    if let Some(repo) = git_repo_name(cwd) {
+                        ui.label(
+                            egui::RichText::new(&repo)
+                                .size(12.5)
+                                .color(palette.accent)
+                                .strong(),
+                        );
+                        if let Some(branch) = git_branch(cwd) {
+                            ui.label(
+                                egui::RichText::new("|")
+                                    .size(11.0)
+                                    .color(palette.muted_text),
+                            );
+                            ui.label(
+                                egui::RichText::new(&branch)
+                                    .size(12.0)
+                                    .color(palette.muted_text),
+                            );
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new(&short_path)
+                                .size(12.5)
+                                .color(palette.text),
+                        );
+                    }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("↻").on_hover_text("Restart shell").clicked() {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("\u{21BB}")
+                                        .size(14.0)
+                                        .color(palette.muted_text),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_text("Restart shell")
+                            .clicked()
+                        {
                             restart_clicked = true;
                         }
 
@@ -1417,17 +2421,24 @@ impl eframe::App for GhostStickiesApp {
                             privacy_toggled = true;
                         }
 
-                        ui.menu_button("Theme", |ui| {
-                            for preset in ThemePreset::ALL {
-                                if ui
-                                    .selectable_label(self.theme == preset, preset.label())
-                                    .clicked()
-                                {
-                                    theme_changed = Some(preset);
-                                    ui.close();
+                        ui.menu_button(
+                            egui::RichText::new("Theme")
+                                .size(12.0)
+                                .color(palette.muted_text),
+                            |ui| {
+                                for preset in ThemePreset::ALL {
+                                    let label = if self.theme == preset {
+                                        egui::RichText::new(preset.label()).color(palette.accent)
+                                    } else {
+                                        egui::RichText::new(preset.label()).color(palette.text)
+                                    };
+                                    if ui.selectable_label(self.theme == preset, label).clicked() {
+                                        theme_changed = Some(preset);
+                                        ui.close();
+                                    }
                                 }
-                            }
-                        });
+                            },
+                        );
                     });
                 });
             });
@@ -1443,7 +2454,7 @@ impl eframe::App for GhostStickiesApp {
         }
 
         if restart_clicked {
-            self.active_tab_mut().restart();
+            self.active_tab_mut().active_pane_mut().restart();
         }
 
         if quit_requested {
@@ -1458,6 +2469,36 @@ impl eframe::App for GhostStickiesApp {
             return;
         }
 
+        // ── Tab bar ──
+        egui::TopBottomPanel::top("tab_bar")
+            .exact_height(TAB_BAR_HEIGHT)
+            .frame(
+                egui::Frame::NONE
+                    .fill(palette.bar_bg)
+                    .inner_margin(egui::Margin::symmetric(10, 4)),
+            )
+            .show(ctx, |ui| {
+                let (switch_to, close_tab, rename_tab, move_tab) =
+                    self.render_tab_bar(ui, palette);
+
+                if let Some((from, to)) = move_tab {
+                    self.move_terminal_tab(from, to);
+                }
+
+                if let Some(index) = close_tab {
+                    self.close_terminal_tab(index);
+                }
+
+                if let Some(index) = rename_tab {
+                    self.start_tab_rename(index);
+                }
+
+                if let Some(index) = switch_to {
+                    self.switch_terminal_tab(index);
+                }
+            });
+
+        // ── Sidebar (Notes) ──
         if self.sidebar_open {
             egui::SidePanel::left("notes_sidebar")
                 .resizable(true)
@@ -1466,7 +2507,6 @@ impl eframe::App for GhostStickiesApp {
                 .frame(
                     egui::Frame::NONE
                         .fill(palette.sidebar_bg)
-                        .stroke(egui::Stroke::new(1.0, palette.border))
                         .inner_margin(egui::Margin::same(12)),
                 )
                 .show(ctx, |ui| {
@@ -1474,11 +2514,6 @@ impl eframe::App for GhostStickiesApp {
                     let mut open_note = false;
                     let mut save_note = false;
                     let mut new_note = false;
-                    let folder_text = self
-                        .notes_root
-                        .as_ref()
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_else(|| "No folder selected".to_owned());
                     let note_text = self
                         .current_note_file
                         .as_ref()
@@ -1493,93 +2528,147 @@ impl eframe::App for GhostStickiesApp {
                         })
                         .unwrap_or_else(|| "No note selected".to_owned());
 
+                    // Header row
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new("Notes")
                                 .strong()
-                                .size(18.0)
+                                .size(16.0)
                                 .color(palette.text),
                         );
 
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if Self::symbol_button(ui, AppSymbol::NotesBack, "Hide notes", false)
-                                .clicked()
-                            {
-                                self.sidebar_open = false;
-                            }
-                        });
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                let toggle_label =
+                                    if self.editing_notes { "Preview" } else { "Edit" };
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new(toggle_label)
+                                                .small()
+                                                .color(palette.muted_text),
+                                        )
+                                        .frame(false),
+                                    )
+                                    .clicked()
+                                {
+                                    self.editing_notes = !self.editing_notes;
+                                }
+                            },
+                        );
                     });
-                    ui.add_space(8.0);
+                    ui.add_space(4.0);
 
+                    // File controls
                     Self::note_surface_frame(palette).show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label(
-                                    egui::RichText::new("Folder")
-                                        .small()
-                                        .color(palette.muted_text),
-                                );
-                                ui.label(
-                                    egui::RichText::new(&folder_text)
-                                        .small()
-                                        .color(palette.text),
-                                );
-                            });
-
+                            ui.label(
+                                egui::RichText::new(&note_text)
+                                    .small()
+                                    .color(palette.muted_text),
+                            );
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.button("Choose").clicked() {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("Save")
+                                                    .small()
+                                                    .color(palette.muted_text),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .clicked()
+                                    {
+                                        save_note = true;
+                                    }
+                                    ui.label(
+                                        egui::RichText::new("\u{2022}")
+                                            .small()
+                                            .color(palette.border),
+                                    );
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("New")
+                                                    .small()
+                                                    .color(palette.muted_text),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .clicked()
+                                    {
+                                        new_note = true;
+                                    }
+                                    ui.label(
+                                        egui::RichText::new("\u{2022}")
+                                            .small()
+                                            .color(palette.border),
+                                    );
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("Open")
+                                                    .small()
+                                                    .color(palette.muted_text),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .clicked()
+                                    {
+                                        open_note = true;
+                                    }
+                                    ui.label(
+                                        egui::RichText::new("\u{2022}")
+                                            .small()
+                                            .color(palette.border),
+                                    );
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("Folder")
+                                                    .small()
+                                                    .color(palette.muted_text),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .clicked()
+                                    {
                                         choose_folder = true;
                                     }
                                 },
                             );
                         });
-
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label(
-                                    egui::RichText::new("Note")
-                                        .small()
-                                        .color(palette.muted_text),
-                                );
-                                ui.label(
-                                    egui::RichText::new(&note_text)
-                                        .small()
-                                        .color(palette.text),
-                                );
-                            });
-
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.button("Save").clicked() {
-                                        save_note = true;
-                                    }
-                                    if ui.button("New").clicked() {
-                                        new_note = true;
-                                    }
-                                    if ui.button("Open").clicked() {
-                                        open_note = true;
-                                    }
-                                },
-                            );
-                        });
                     });
 
-                    ui.add_space(10.0);
-                    let editor_height = ui.available_height().max(220.0);
+                    ui.add_space(6.0);
+
+                    let status_height = 20.0;
+                    let content_height = (ui.available_height() - status_height - 8.0).max(100.0);
+
                     Self::note_surface_frame(palette).show(ui, |ui| {
-                        let editor = egui::TextEdit::multiline(&mut self.notes_markdown)
-                            .code_editor()
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(18)
-                            .hint_text("Write markdown here.");
-                        ui.add_sized([ui.available_width(), editor_height], editor);
+                        if self.editing_notes {
+                            let editor = egui::TextEdit::multiline(&mut self.notes_markdown)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(18)
+                                .hint_text("Write markdown here. Cmd+L to add a checkbox.");
+                            ui.add_sized([ui.available_width(), content_height], editor);
+                        } else {
+                            let preview_changed = Self::render_markdown_preview(
+                                ui,
+                                &mut self.notes_markdown,
+                                palette,
+                                content_height,
+                            );
+                            if preview_changed {
+                                save_note = true;
+                            }
+                        }
                     });
 
-                    ui.add_space(8.0);
+                    ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(&self.note_status)
                             .small()
@@ -1602,143 +2691,51 @@ impl eframe::App for GhostStickiesApp {
                         self.save_current_note();
                     }
                 });
-        } else {
-            egui::SidePanel::left("notes_tab_collapsed")
-                .exact_width(28.0)
-                .frame(
-                    egui::Frame::NONE
-                        .fill(palette.bar_bg)
-                        .stroke(egui::Stroke::new(1.0, palette.border)),
-                )
+        }
+
+        // ── Debug log window ──
+        if self.show_debug {
+            egui::Window::new("Debug Log")
+                .default_size([480.0, 320.0])
+                .collapsible(true)
+                .resizable(true)
                 .show(ctx, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(8.0);
-                        if Self::symbol_button(ui, AppSymbol::NotesForward, "Show notes", false)
-                            .clicked()
-                        {
-                            self.sidebar_open = true;
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{} entries", self.debug_log.len()))
+                                .small()
+                                .color(palette.muted_text),
+                        );
+                        if ui.button("Clear").clicked() {
+                            self.debug_log.clear();
                         }
                     });
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for entry in &self.debug_log {
+                                ui.label(
+                                    egui::RichText::new(entry)
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(palette.text),
+                                );
+                            }
+                        });
                 });
         }
 
+        // ── Central panel: terminal panes ──
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
                     .fill(palette.bg)
-                    .stroke(egui::Stroke::new(1.0, palette.border))
-                    .inner_margin(egui::Margin::same(10)),
+                    .inner_margin(egui::Margin::same(4)),
             )
             .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    let mut switch_to = None;
-                    let mut move_tab = None;
-                    let mut close_tab = None;
-                    let mut rename_tab = None;
-
-                    for index in 0..self.terminal_tabs.len() {
-                        let selected = index == self.active_terminal;
-                        let renaming = self.renaming_tab == Some(index);
-
-                        if renaming {
-                            let response = ui.add_sized(
-                                [140.0, 28.0],
-                                egui::TextEdit::singleline(&mut self.rename_buffer)
-                                    .clip_text(false)
-                                    .desired_width(140.0),
-                            );
-
-                            if response.lost_focus()
-                                && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                            {
-                                self.commit_tab_rename();
-                            }
-
-                            if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
-                                self.cancel_tab_rename();
-                            }
-
-                            response.request_focus();
-                            continue;
-                        }
-
-                        let response = ui.add(
-                            egui::Button::new(&self.terminal_tabs[index].title)
-                                .selected(selected)
-                                .sense(egui::Sense::click_and_drag()),
-                        );
-
-                        if response.clicked() {
-                            switch_to = Some(index);
-                        }
-
-                        response.context_menu(|ui| {
-                            if ui.button("Rename").clicked() {
-                                rename_tab = Some(index);
-                                ui.close();
-                            }
-
-                            if ui
-                                .add_enabled(
-                                    self.terminal_tabs.len() > 1,
-                                    egui::Button::new("Close"),
-                                )
-                                .clicked()
-                            {
-                                close_tab = Some(index);
-                                ui.close();
-                            }
-                        });
-
-                        if response.dragged() {
-                            if let Some(pointer_pos) = response.interact_pointer_pos() {
-                                if pointer_pos.x < response.rect.left() && index > 0 {
-                                    move_tab = Some((index, index - 1));
-                                } else if pointer_pos.x > response.rect.right()
-                                    && index + 1 < self.terminal_tabs.len()
-                                {
-                                    move_tab = Some((index, index + 1));
-                                }
-                            }
-                        }
-                    }
-
-                    if let Some((from, to)) = move_tab {
-                        self.move_terminal_tab(from, to);
-                    }
-
-                    if let Some(index) = close_tab {
-                        self.close_terminal_tab(index);
-                    }
-
-                    if let Some(index) = rename_tab {
-                        self.start_tab_rename(index);
-                    }
-
-                    if let Some(index) = switch_to {
-                        self.switch_terminal_tab(index);
-                    }
-                });
-
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if self.active_tab().parser.screen().scrollback() > 0 {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "History {}",
-                                self.active_tab().parser.screen().scrollback()
-                            ))
-                            .small()
-                            .color(palette.muted_text),
-                        );
-                    }
-                    if self.active_tab().selection_exists() && ui.button("Copy").clicked() {
-                        let _ = self.active_tab().copy_selection(ctx);
-                    }
-                });
-                ui.add_space(10.0);
-
-                self.render_terminal(ui, palette, ctx);
+                self.render_panes(ui, palette, ctx);
             });
     }
 

@@ -2,9 +2,11 @@
 name = "ghost_stickies"
 version = "0.1.0"
 edition = "2021"
+description = "StickyTerminal desktop app"
 
 [package.metadata.bundle]
 name = "StickyTerminal"
+identifier = "com.witchaudio.stickyterminal"
 icon = ["assets/macos/StickyTerminal.icns"]
 
 [features]
