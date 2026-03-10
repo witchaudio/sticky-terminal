@@ -65,6 +65,7 @@ struct TerminalPoint {
 // ── A single terminal session (pane) ──
 struct TerminalPane {
     uid: u64, // unique ID that survives reordering
+    title: String,
     cwd: PathBuf,
     parser: Parser,
     rx: Option<Receiver<Vec<u8>>>,
@@ -83,14 +84,16 @@ struct TerminalTab {
     title: String,
     panes: Vec<TerminalPane>,
     active_pane: usize,
-}
-
-struct GhostStickiesApp {
     notes_markdown: String,
-    notes_root: Option<PathBuf>,
     current_note_file: Option<PathBuf>,
     note_status: String,
     editing_notes: bool,
+    notes_dirty: bool,
+    last_type_time: Option<std::time::Instant>,
+}
+
+struct GhostStickiesApp {
+    notes_root: Option<PathBuf>,
     theme: ThemePreset,
     minimized: bool,
     sidebar_open: bool,
@@ -106,6 +109,9 @@ struct GhostStickiesApp {
     // Debug log
     debug_log: VecDeque<String>,
     show_debug: bool,
+    recent_notes: Vec<PathBuf>,
+    renaming_pane: Option<(usize, usize)>, // (tab_idx, pane_idx)
+    pane_rename_buffer: String,
 }
 
 const DEBUG_LOG_MAX: usize = 200;
@@ -115,6 +121,8 @@ struct AppConfig {
     notes_root: Option<PathBuf>,
     current_note_file: Option<PathBuf>,
     theme: ThemePreset,
+    #[serde(default)]
+    recent_notes: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -231,6 +239,7 @@ impl TerminalPane {
 
         Self {
             uid,
+            title: String::new(),
             cwd,
             parser: Parser::new(rows, cols, TERMINAL_SCROLLBACK),
             rx: None,
@@ -469,6 +478,19 @@ impl TerminalPane {
         false
     }
 
+    fn paste_text(&mut self, text: &str) {
+        self.selection = None;
+        self.set_scrollback(0);
+        if self.parser.screen().bracketed_paste() {
+            let mut bytes = b"\x1b[200~".to_vec();
+            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+            self.write_bytes(&bytes);
+        } else {
+            self.write_bytes(text.as_bytes());
+        }
+    }
+
     fn cell_from_pos(
         &self,
         rect: egui::Rect,
@@ -529,16 +551,7 @@ impl TerminalPane {
                     }
                 }
                 egui::Event::Paste(text) => {
-                    self.selection = None;
-                    self.set_scrollback(0);
-                    if self.parser.screen().bracketed_paste() {
-                        let mut bytes = b"\x1b[200~".to_vec();
-                        bytes.extend_from_slice(text.as_bytes());
-                        bytes.extend_from_slice(b"\x1b[201~");
-                        self.write_bytes(&bytes);
-                    } else {
-                        self.write_bytes(text.as_bytes());
-                    }
+                    self.paste_text(&text);
                 }
                 egui::Event::Key {
                     key,
@@ -557,6 +570,12 @@ impl TerminalPane {
                                 self.select_all();
                                 continue;
                             }
+                            egui::Key::V => {
+                                if let Some(text) = read_clipboard() {
+                                    self.paste_text(&text);
+                                }
+                                continue;
+                            }
                             egui::Key::Backspace | egui::Key::ArrowLeft | egui::Key::ArrowRight => {
                             }
                             _ => continue,
@@ -568,6 +587,9 @@ impl TerminalPane {
                         self.set_scrollback(0);
                         self.write_bytes(&bytes);
                     }
+                }
+                egui::Event::Copy => {
+                    self.copy_selection(ctx);
                 }
                 _ => {}
             }
@@ -592,7 +614,7 @@ impl TerminalPane {
 
         if modifiers.alt {
             let alt_bytes = match key {
-                egui::Key::Backspace => Some(b"\x1b\x7f".to_vec()),
+                egui::Key::Backspace => Some(vec![0x17]), // Ctrl+W = backward-kill-word
                 egui::Key::ArrowLeft => Some(b"\x1bb".to_vec()),
                 egui::Key::ArrowRight => Some(b"\x1bf".to_vec()),
                 _ => None,
@@ -628,7 +650,13 @@ impl TerminalPane {
         }
 
         let bytes = match key {
-            egui::Key::Enter => b"\r".to_vec(),
+            egui::Key::Enter => {
+                if modifiers.shift {
+                    b"\n".to_vec()
+                } else {
+                    b"\r".to_vec()
+                }
+            }
             egui::Key::Tab => {
                 if modifiers.shift {
                     b"\x1b[Z".to_vec()
@@ -699,6 +727,36 @@ impl Drop for TerminalPane {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn read_clipboard() -> Option<String> {
+    unsafe {
+        let pasteboard: *mut Object = msg_send![class!(NSPasteboard), generalPasteboard];
+        if pasteboard.is_null() {
+            return None;
+        }
+        let ns_string_class = class!(NSString);
+        let type_str: *mut Object = msg_send![
+            ns_string_class,
+            stringWithUTF8String: b"public.utf8-plain-text\0".as_ptr()
+        ];
+        let content: *mut Object = msg_send![pasteboard, stringForType: type_str];
+        if content.is_null() {
+            return None;
+        }
+        let utf8: *const std::os::raw::c_char = msg_send![content, UTF8String];
+        if utf8.is_null() {
+            return None;
+        }
+        let cstr = std::ffi::CStr::from_ptr(utf8);
+        Some(cstr.to_string_lossy().into_owned())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_clipboard() -> Option<String> {
+    None
+}
+
 fn shell_escape_path(path: &Path) -> String {
     let display = path.to_string_lossy();
     let escaped = display.replace('\'', "'\\''");
@@ -713,6 +771,12 @@ impl TerminalTab {
             title: format!("Tab {number}"),
             panes: vec![TerminalPane::new(uid, cwd)],
             active_pane: 0,
+            notes_markdown: "# TODO\n- [ ] Keep this shell usable for Codex CLI\n- [ ] Add quick project tabs\n- [ ] Save notes between sessions\n\n## Notes\nWrite markdown on the left.\nUse the right side like a real terminal.".to_owned(),
+            current_note_file: None,
+            note_status: "Set your notes folder to start saving notes.".to_owned(),
+            editing_notes: false,
+            notes_dirty: false,
+            last_type_time: None,
         }
     }
 
@@ -738,6 +802,19 @@ impl TerminalTab {
         self.panes.remove(self.active_pane);
         if self.active_pane >= self.panes.len() {
             self.active_pane = self.panes.len() - 1;
+        }
+        true
+    }
+
+    fn close_pane(&mut self, idx: usize) -> bool {
+        if self.panes.len() <= 1 || idx >= self.panes.len() {
+            return false;
+        }
+        self.panes.remove(idx);
+        if self.active_pane >= self.panes.len() {
+            self.active_pane = self.panes.len() - 1;
+        } else if self.active_pane > idx {
+            self.active_pane -= 1;
         }
         true
     }
@@ -832,11 +909,7 @@ impl Default for GhostStickiesApp {
         let cwd = default_terminal_cwd();
 
         Self {
-            notes_markdown: "# TODO\n- [ ] Keep this shell usable for Codex CLI\n- [ ] Add quick project tabs\n- [ ] Save notes between sessions\n\n## Notes\nWrite markdown on the left.\nUse the right side like a real terminal.".to_owned(),
             notes_root: None,
-            current_note_file: None,
-            note_status: "Set your notes folder to start saving notes.".to_owned(),
-            editing_notes: false,
             theme: ThemePreset::default(),
             minimized: false,
             sidebar_open: false,
@@ -851,6 +924,9 @@ impl Default for GhostStickiesApp {
             rename_buffer: String::new(),
             debug_log: VecDeque::new(),
             show_debug: false,
+            recent_notes: Vec::new(),
+            renaming_pane: None,
+            pane_rename_buffer: String::new(),
         }
     }
 }
@@ -912,43 +988,46 @@ impl GhostStickiesApp {
         };
 
         let Ok(config) = serde_json::from_str::<AppConfig>(&contents) else {
-            self.note_status = "Could not read saved settings. Using defaults.".to_owned();
+            self.terminal_tabs[0].note_status = "Could not read saved settings. Using defaults.".to_owned();
             return;
         };
 
         self.theme = config.theme;
-        self.current_note_file = config.current_note_file;
+        self.terminal_tabs[0].current_note_file = config.current_note_file;
+        self.recent_notes = config.recent_notes;
 
         if let Some(root) = config.notes_root {
             self.notes_root = Some(root);
-            if self.current_note_file.is_none() {
-                self.current_note_file = self.default_note_file();
+            if self.terminal_tabs[0].current_note_file.is_none() {
+                self.terminal_tabs[0].current_note_file = self.default_note_file();
             }
             self.load_current_note();
         }
     }
 
     fn save_config(&mut self) {
+        let ti = self.active_terminal;
         let config = AppConfig {
             notes_root: self.notes_root.clone(),
-            current_note_file: self.current_note_file.clone(),
+            current_note_file: self.terminal_tabs[ti].current_note_file.clone(),
             theme: self.theme,
+            recent_notes: self.recent_notes.clone(),
         };
 
         let support_dir = Self::app_support_dir();
         if let Err(err) = fs::create_dir_all(&support_dir) {
-            self.note_status = format!("Could not create app settings folder: {err}");
+            self.terminal_tabs[ti].note_status = format!("Could not create app settings folder: {err}");
             return;
         }
 
         match serde_json::to_string_pretty(&config) {
             Ok(contents) => {
                 if let Err(err) = fs::write(Self::config_path(), contents) {
-                    self.note_status = format!("Could not save settings: {err}");
+                    self.terminal_tabs[ti].note_status = format!("Could not save settings: {err}");
                 }
             }
             Err(err) => {
-                self.note_status = format!("Could not encode settings: {err}");
+                self.terminal_tabs[ti].note_status = format!("Could not encode settings: {err}");
             }
         }
     }
@@ -971,7 +1050,7 @@ impl GhostStickiesApp {
     }
 
     fn note_file_path(&self) -> Option<PathBuf> {
-        self.current_note_file.clone()
+        self.terminal_tabs[self.active_terminal].current_note_file.clone()
     }
 
     fn choose_notes_root(&mut self) {
@@ -987,27 +1066,30 @@ impl GhostStickiesApp {
 
         let root = Self::normalize_notes_root(selected_dir);
         if let Err(err) = fs::create_dir_all(&root) {
-            self.note_status = format!("Could not create notes folder: {err}");
+            let ti = self.active_terminal;
+            self.terminal_tabs[ti].note_status = format!("Could not create notes folder: {err}");
             return;
         }
 
         self.notes_root = Some(root.clone());
-        let note_still_inside_root = self
+        let ti = self.active_terminal;
+        let note_still_inside_root = self.terminal_tabs[ti]
             .current_note_file
             .as_ref()
             .map(|path| path.starts_with(&root))
             .unwrap_or(false);
         if !note_still_inside_root {
-            self.current_note_file = self.default_note_file();
+            self.terminal_tabs[ti].current_note_file = self.default_note_file();
         }
-        self.note_status = format!("Using notes folder: {}", root.display());
+        self.terminal_tabs[ti].note_status = format!("Using notes folder: {}", root.display());
         self.save_config();
         self.load_current_note();
     }
 
     fn choose_existing_note(&mut self) {
+        let ti = self.active_terminal;
         let Some(root) = self.notes_root.clone() else {
-            self.note_status = "Choose your notes folder first.".to_owned();
+            self.terminal_tabs[ti].note_status = "Choose your notes folder first.".to_owned();
             return;
         };
 
@@ -1020,64 +1102,95 @@ impl GhostStickiesApp {
         };
 
         if !file.starts_with(&root) {
-            self.note_status = "Pick a note inside your notes folder.".to_owned();
+            self.terminal_tabs[ti].note_status = "Pick a note inside your notes folder.".to_owned();
             return;
         }
 
-        self.current_note_file = Some(file);
+        self.terminal_tabs[ti].current_note_file = Some(file);
         self.load_current_note();
     }
 
+    fn add_to_recent_notes(&mut self) {
+        if let Some(path) = self.terminal_tabs[self.active_terminal].current_note_file.clone() {
+            self.recent_notes.retain(|p| p != &path);
+            self.recent_notes.insert(0, path);
+            self.recent_notes.truncate(10);
+        }
+    }
+
+    fn save_current_note_silent(&mut self) {
+        let Some(path) = self.note_file_path() else { return };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let ti = self.active_terminal;
+        if fs::write(&path, &self.terminal_tabs[ti].notes_markdown).is_ok() {
+            self.terminal_tabs[ti].notes_dirty = false;
+            self.terminal_tabs[ti].last_type_time = None;
+        }
+    }
+
     fn save_current_note(&mut self) {
+        let ti = self.active_terminal;
         let Some(path) = self.note_file_path() else {
-            self.note_status = "Choose your notes folder and a note first.".to_owned();
+            self.terminal_tabs[ti].note_status = "Choose your notes folder and a note first.".to_owned();
             return;
         };
 
         if let Some(parent) = path.parent() {
             if let Err(err) = fs::create_dir_all(parent) {
-                self.note_status = format!("Could not create note folders: {err}");
+                self.terminal_tabs[ti].note_status = format!("Could not create note folders: {err}");
                 return;
             }
         }
 
-        match fs::write(&path, &self.notes_markdown) {
+        match fs::write(&path, &self.terminal_tabs[ti].notes_markdown) {
             Ok(_) => {
-                self.note_status = format!("Saved {}", path.display());
+                self.terminal_tabs[ti].note_status = format!("Saved {}", path.display());
+                self.terminal_tabs[ti].notes_dirty = false;
+                self.terminal_tabs[ti].last_type_time = None;
                 self.save_config();
             }
             Err(err) => {
-                self.note_status = format!("Could not save note: {err}");
+                self.terminal_tabs[ti].note_status = format!("Could not save note: {err}");
             }
         }
     }
 
     fn load_current_note(&mut self) {
+        let ti = self.active_terminal;
         let Some(path) = self.note_file_path() else {
-            self.note_status = "Pick a note file to start writing.".to_owned();
+            self.terminal_tabs[ti].note_status = "Pick a note file to start writing.".to_owned();
             return;
         };
 
+        self.add_to_recent_notes();
         self.save_config();
 
+        let ti = self.active_terminal;
         match fs::read_to_string(&path) {
             Ok(contents) => {
-                self.notes_markdown = contents;
-                self.note_status = format!("Loaded {}", path.display());
+                self.terminal_tabs[ti].notes_markdown = contents;
+                self.terminal_tabs[ti].notes_dirty = false;
+                self.terminal_tabs[ti].last_type_time = None;
+                self.terminal_tabs[ti].note_status = format!("Loaded {}", path.display());
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                self.notes_markdown = "# Inbox\n\nStart writing here.".to_owned();
-                self.note_status = format!("New note ready: {}", path.display());
+                self.terminal_tabs[ti].notes_markdown = "# Inbox\n\nStart writing here.".to_owned();
+                self.terminal_tabs[ti].notes_dirty = false;
+                self.terminal_tabs[ti].last_type_time = None;
+                self.terminal_tabs[ti].note_status = format!("New note ready: {}", path.display());
             }
             Err(err) => {
-                self.note_status = format!("Could not load note: {err}");
+                self.terminal_tabs[ti].note_status = format!("Could not load note: {err}");
             }
         }
     }
 
     fn create_new_note(&mut self) {
+        let ti = self.active_terminal;
         let Some(root) = self.notes_root.clone() else {
-            self.note_status = "Choose your notes folder first.".to_owned();
+            self.terminal_tabs[ti].note_status = "Choose your notes folder first.".to_owned();
             return;
         };
 
@@ -1091,17 +1204,17 @@ impl GhostStickiesApp {
         };
 
         if !path.starts_with(&root) {
-            self.note_status = "Save the note inside your notes folder.".to_owned();
+            self.terminal_tabs[ti].note_status = "Save the note inside your notes folder.".to_owned();
             return;
         }
 
-        self.current_note_file = Some(if path.extension().is_none() {
+        self.terminal_tabs[ti].current_note_file = Some(if path.extension().is_none() {
             path.with_extension("md")
         } else {
             path
         });
-        self.notes_markdown = "# New note\n\n".to_owned();
-        self.note_status = "New note ready. Press Save to write it to disk.".to_owned();
+        self.terminal_tabs[ti].notes_markdown = "# New note\n\n".to_owned();
+        self.terminal_tabs[ti].note_status = "New note ready. Press Save to write it to disk.".to_owned();
         self.save_config();
     }
 
@@ -1136,7 +1249,6 @@ impl GhostStickiesApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
-                let wrap_width = ui.available_width();
 
                 let lines: Vec<String> = markdown.lines().map(|s| s.to_owned()).collect();
                 let mut line_idx = 0;
@@ -1203,9 +1315,7 @@ impl GhostStickiesApp {
                                 Self::toggle_line_checkbox(markdown, line_idx, false);
                                 changed = true;
                             }
-                            let text_width = (wrap_width - left_margin - 28.0).max(40.0);
-                            ui.add_sized(
-                                [text_width, 0.0],
+                            ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(task_text)
                                         .strikethrough()
@@ -1227,9 +1337,7 @@ impl GhostStickiesApp {
                                 Self::toggle_line_checkbox(markdown, line_idx, true);
                                 changed = true;
                             }
-                            let text_width = (wrap_width - left_margin - 28.0).max(40.0);
-                            ui.add_sized(
-                                [text_width, 0.0],
+                            ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(task_text).color(palette.text),
                                 )
@@ -1244,9 +1352,7 @@ impl GhostStickiesApp {
                                 ui.add_space(left_margin);
                             }
                             ui.label(egui::RichText::new("\u{2022}").color(palette.accent));
-                            let text_width = (wrap_width - left_margin - 16.0).max(40.0);
-                            ui.add_sized(
-                                [text_width, 0.0],
+                            ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(Self::render_inline_markdown(bullet_text))
                                         .color(palette.text),
@@ -1266,9 +1372,7 @@ impl GhostStickiesApp {
                         if left_margin > 0.0 {
                             ui.horizontal_wrapped(|ui| {
                                 ui.add_space(left_margin);
-                                let text_width = (wrap_width - left_margin).max(40.0);
-                                ui.add_sized(
-                                    [text_width, 0.0],
+                                ui.add(
                                     egui::Label::new(
                                         egui::RichText::new(Self::render_inline_markdown(trimmed))
                                             .color(palette.text),
@@ -1295,7 +1399,95 @@ impl GhostStickiesApp {
     }
 
     fn render_inline_markdown(text: &str) -> String {
-        text.replace("**", "").replace('*', "")
+        let text = text.replace("**", "").replace('*', "");
+        // Strip [link text](url) -> link text
+        let mut result = String::new();
+        let mut rest = text.as_str();
+        while let Some(bracket_start) = rest.find('[') {
+            result.push_str(&rest[..bracket_start]);
+            let after_open = &rest[bracket_start + 1..];
+            if let Some(bracket_end) = after_open.find("](") {
+                let link_text = &after_open[..bracket_end];
+                let after_paren = &after_open[bracket_end + 2..];
+                if let Some(paren_end) = after_paren.find(')') {
+                    result.push_str(link_text);
+                    rest = &after_paren[paren_end + 1..];
+                } else {
+                    result.push('[');
+                    rest = after_open;
+                }
+            } else {
+                result.push('[');
+                rest = after_open;
+            }
+        }
+        result.push_str(rest);
+        result
+    }
+
+    /// Scan one terminal row and return URL spans as (start_col, end_col_inclusive, url).
+    fn find_row_url_spans(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<(u16, u16, String)> {
+        // Build a char→column map so byte positions in the string map back to terminal cols.
+        let mut char_to_col: Vec<u16> = Vec::with_capacity(cols as usize);
+        let mut row_str = String::with_capacity(cols as usize);
+        for col in 0..cols {
+            if let Some(cell) = screen.cell(row, col) {
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+                let content = cell.contents();
+                if content.is_empty() {
+                    char_to_col.push(col);
+                    row_str.push(' ');
+                } else {
+                    for ch in content.chars() {
+                        char_to_col.push(col);
+                        row_str.push(ch);
+                    }
+                }
+            } else {
+                char_to_col.push(col);
+                row_str.push(' ');
+            }
+        }
+
+        let mut spans: Vec<(u16, u16, String)> = Vec::new();
+        let mut search_from = 0usize;
+        loop {
+            let found = ["https://", "http://", "ftp://"]
+                .iter()
+                .filter_map(|p| row_str[search_from..].find(p).map(|pos| (search_from + pos, *p)))
+                .min_by_key(|(pos, _)| *pos);
+            let Some((abs_start, prefix)) = found else { break };
+            let url_tail = &row_str[abs_start..];
+            let url_end = url_tail
+                .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | ']' | '>' | '<'))
+                .unwrap_or(url_tail.len());
+            if url_end > prefix.len() {
+                let url = url_tail[..url_end].to_string();
+                let start_col = char_to_col.get(abs_start).copied().unwrap_or(0);
+                let end_col = char_to_col
+                    .get(abs_start + url_end - 1)
+                    .copied()
+                    .unwrap_or(start_col);
+                spans.push((start_col, end_col, url));
+                search_from = abs_start + url_end;
+            } else {
+                search_from = abs_start + prefix.len();
+            }
+        }
+        spans
+    }
+
+    fn open_url(url: &str) {
+        #[cfg(target_os = "macos")]
+        let _ = std::process::Command::new("open").arg(url).spawn();
+        #[cfg(target_os = "linux")]
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+        #[cfg(target_os = "windows")]
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn();
     }
 
     fn toggle_line_checkbox(markdown: &mut String, line_index: usize, checked: bool) {
@@ -1573,7 +1765,7 @@ impl GhostStickiesApp {
         frame.show(ui, |ui| {
             let terminal_id = pane_id.with("terminal_surface");
             let size = ui.available_size();
-            let (rect, _response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+            let (_, rect) = ui.allocate_space(size);
             let response = ui.interact(rect, terminal_id, egui::Sense::click_and_drag());
             let hovered_files = ctx.input(|input| input.raw.hovered_files.clone());
             let dropped_files = ctx.input(|input| input.raw.dropped_files.clone());
@@ -1591,9 +1783,33 @@ impl GhostStickiesApp {
 
             pane.resize(rows, cols);
 
+            let cmd_held = ctx.input(|i| i.modifiers.command);
+
             if response.clicked() {
-                response.request_focus();
-                pane.selection = None;
+                let mut url_opened = false;
+                if cmd_held {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let point =
+                            pane.cell_from_pos(rect, pos, char_width, row_height, inner_padding);
+                        let url_to_open = {
+                            let screen = pane.parser.screen();
+                            let spans =
+                                Self::find_row_url_spans(screen, point.row, pane.cols);
+                            spans
+                                .into_iter()
+                                .find(|(s, e, _)| point.col >= *s && point.col <= *e)
+                                .map(|(_, _, url)| url)
+                        };
+                        if let Some(url) = url_to_open {
+                            Self::open_url(&url);
+                            url_opened = true;
+                        }
+                    }
+                }
+                if !url_opened {
+                    response.request_focus();
+                    pane.selection = None;
+                }
             }
 
             if response.drag_started() {
@@ -1674,7 +1890,24 @@ impl GhostStickiesApp {
             }
 
             let screen = pane.parser.screen();
+
+            // Cell position under the pointer (for URL hover highlight).
+            let hovered_cell = if cmd_held && response.hovered() {
+                ctx.input(|i| i.pointer.hover_pos())
+                    .filter(|p| rect.contains(*p))
+                    .map(|p| pane.cell_from_pos(rect, p, char_width, row_height, inner_padding))
+            } else {
+                None
+            };
+            let mut set_hand_cursor = false;
+
             for row in 0..pane.rows {
+                let url_spans: Vec<(u16, u16, String)> = if cmd_held {
+                    Self::find_row_url_spans(screen, row, pane.cols)
+                } else {
+                    Vec::new()
+                };
+
                 for col in 0..pane.cols {
                     let Some(cell) = screen.cell(row, col) else {
                         continue;
@@ -1743,7 +1976,38 @@ impl GhostStickiesApp {
                             egui::Stroke::new(1.0, fg),
                         );
                     }
+
+                    // URL underline when Cmd is held.
+                    if let Some((us, ue, _)) =
+                        url_spans.iter().find(|(s, e, _)| col >= *s && col <= *e)
+                    {
+                        let is_hovered = hovered_cell
+                            .map(|hp| {
+                                hp.row == row && hp.col >= *us && hp.col <= *ue
+                            })
+                            .unwrap_or(false);
+                        if is_hovered {
+                            set_hand_cursor = true;
+                        }
+                        let ucolor = if is_hovered {
+                            palette.accent
+                        } else {
+                            palette.accent.linear_multiply(0.5)
+                        };
+                        let y = cell_rect.bottom() - 2.0;
+                        painter.line_segment(
+                            [
+                                egui::pos2(cell_rect.left(), y),
+                                egui::pos2(cell_rect.right(), y),
+                            ],
+                            egui::Stroke::new(1.0, ucolor),
+                        );
+                    }
                 }
+            }
+
+            if set_hand_cursor {
+                ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
             }
 
             let (cursor_row, cursor_col) = screen.cursor_position();
@@ -1867,18 +2131,188 @@ impl GhostStickiesApp {
             }
         }
 
+        const BAR_H: f32 = 24.0;
+
         // Render each pane in its grid slot
-        let mut swap_target: Option<(usize, usize)> = None;
+        let mut pending_focus: Option<usize> = None;
+        let mut pending_swap: Option<(usize, usize)> = None;
+        let mut pending_close: Option<usize> = None;
+        let mut pending_rename_start: Option<(usize, String)> = None; // (pane_idx, current_title)
+        let mut pending_rename_commit = false;
+        let mut pending_rename_cancel = false;
 
         for pane_idx in 0..num_panes {
-            let rect = pane_rects[pane_idx];
+            let full_rect = pane_rects[pane_idx];
             let is_active = pane_idx == active_pane_idx;
             let pane_uid = self.terminal_tabs[tab_idx].panes[pane_idx].uid;
             let pane_id = ui.id().with(("pane_uid", pane_uid));
 
-            // Create a child UI constrained to this pane's rect
-            let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
-            child_ui.set_clip_rect(rect);
+            // Split full rect into bar + content
+            let bar_rect = egui::Rect::from_min_size(
+                full_rect.min,
+                egui::vec2(full_rect.width(), BAR_H),
+            );
+            let content_rect = egui::Rect::from_min_max(
+                egui::pos2(full_rect.min.x, full_rect.min.y + BAR_H),
+                full_rect.max,
+            );
+
+            // ── Title bar ──────────────────────────────────────────────────
+            let bar_bg = if is_active {
+                palette.surface
+            } else {
+                palette.bar_bg
+            };
+            ui.painter().rect_filled(bar_rect, egui::CornerRadius::ZERO, bar_bg);
+
+            // Drag handle (left side) — click focuses pane, drag swaps
+            let handle_rect = egui::Rect::from_min_size(
+                egui::pos2(bar_rect.left(), bar_rect.top()),
+                egui::vec2(28.0, BAR_H),
+            );
+            let handle_id = pane_id.with("bar_handle");
+            let handle_resp = ui.interact(handle_rect, handle_id, egui::Sense::click_and_drag());
+            let handle_color = if handle_resp.hovered() || handle_resp.dragged() {
+                palette.accent
+            } else {
+                palette.muted_text.linear_multiply(0.5)
+            };
+            // Draw ⠿ grid dots as 6 tiny circles arranged 2×3
+            {
+                let cx = handle_rect.center().x;
+                let cy = handle_rect.center().y;
+                let dx = 3.0_f32;
+                let dy = 3.0_f32;
+                let r = 1.2_f32;
+                for row in [-1i32, 0, 1] {
+                    for col in [-1i32, 1] {
+                        ui.painter().circle_filled(
+                            egui::pos2(cx + col as f32 * dx, cy + row as f32 * dy),
+                            r,
+                            handle_color,
+                        );
+                    }
+                }
+            }
+
+            if handle_resp.clicked() {
+                pending_focus = Some(pane_idx);
+            }
+            if handle_resp.drag_started() {
+                let handle_center = handle_rect.center();
+                ui.data_mut(|d| {
+                    d.insert_temp(egui::Id::new("bar_drag_from"), pane_idx);
+                    d.insert_temp(egui::Id::new("bar_drag_origin"), handle_center);
+                });
+            }
+            if handle_resp.drag_stopped() {
+                let from: Option<usize> =
+                    ui.data(|d| d.get_temp(egui::Id::new("bar_drag_from")));
+                if let Some(from_idx) = from {
+                    if let Some(pos) = handle_resp.interact_pointer_pos() {
+                        for (to_idx, to_rect) in pane_rects.iter().enumerate() {
+                            if to_idx != from_idx && to_rect.contains(pos) {
+                                pending_swap = Some((from_idx, to_idx));
+                                break;
+                            }
+                        }
+                    }
+                }
+                ui.data_mut(|d| {
+                    d.remove_by_type::<usize>();
+                    d.remove_by_type::<egui::Pos2>();
+                });
+            }
+
+            // X close button (right side)
+            let close_btn_size = egui::vec2(BAR_H, BAR_H);
+            let close_rect = egui::Rect::from_min_size(
+                egui::pos2(bar_rect.right() - close_btn_size.x, bar_rect.top()),
+                close_btn_size,
+            );
+            let close_id = pane_id.with("bar_close");
+            let close_resp = ui.interact(close_rect, close_id, egui::Sense::click());
+            let close_color = if close_resp.hovered() {
+                egui::Color32::from_rgb(220, 80, 80)
+            } else {
+                palette.muted_text.linear_multiply(0.5)
+            };
+            ui.painter().text(
+                close_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "×",
+                egui::FontId::proportional(14.0),
+                close_color,
+            );
+            if close_resp.clicked() {
+                pending_close = Some(pane_idx);
+            }
+
+            // Pane title (center of bar, between handle and close button)
+            let title_rect = egui::Rect::from_min_max(
+                egui::pos2(bar_rect.left() + 28.0, bar_rect.top()),
+                egui::pos2(bar_rect.right() - close_btn_size.x, bar_rect.bottom()),
+            );
+            let is_renaming = self.renaming_pane == Some((tab_idx, pane_idx));
+
+            if is_renaming {
+                // Inline text edit for rename
+                let rename_id = pane_id.with("bar_rename_edit");
+                let mut rename_ui = ui.new_child(
+                    egui::UiBuilder::new().max_rect(title_rect.shrink(2.0)),
+                );
+                let edit_resp = rename_ui.add(
+                    egui::TextEdit::singleline(&mut self.pane_rename_buffer)
+                        .id(rename_id)
+                        .desired_width(title_rect.width() - 4.0)
+                        .font(egui::TextStyle::Small)
+                        .frame(false),
+                );
+                edit_resp.request_focus();
+                // Check keys via ctx — single-line TextEdit does NOT lose focus on Enter
+                let pressed_enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+                let pressed_esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+                if pressed_esc {
+                    pending_rename_cancel = true;
+                } else if pressed_enter {
+                    pending_rename_commit = true;
+                } else if edit_resp.lost_focus() {
+                    // Clicked somewhere else — commit
+                    pending_rename_commit = true;
+                }
+            } else {
+                // Display title; double-click to rename
+                let current_title = &self.terminal_tabs[tab_idx].panes[pane_idx].title;
+                let display_title = if current_title.is_empty() {
+                    format!("Terminal {}", pane_idx + 1)
+                } else {
+                    current_title.clone()
+                };
+                let title_color = if is_active {
+                    palette.text
+                } else {
+                    palette.muted_text
+                };
+                let title_id = pane_id.with("bar_title");
+                let title_resp = ui.interact(title_rect, title_id, egui::Sense::click());
+                ui.painter().text(
+                    title_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &display_title,
+                    egui::FontId::proportional(11.0),
+                    title_color,
+                );
+                if title_resp.double_clicked() {
+                    pending_rename_start = Some((pane_idx, display_title));
+                }
+                if title_resp.clicked() {
+                    pending_focus = Some(pane_idx);
+                }
+            }
+
+            // ── Terminal content ────────────────────────────────────────────
+            let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(content_rect));
+            child_ui.set_clip_rect(content_rect);
 
             let pane = &mut self.terminal_tabs[tab_idx].panes[pane_idx];
             Self::render_pane(pane, &mut child_ui, palette, ctx, pane_id, is_active);
@@ -1891,35 +2325,71 @@ impl GhostStickiesApp {
                     self.terminal_tabs[tab_idx].panes[pane_idx].uid
                 ));
             }
+        }
 
-            // Drag-to-swap detection: if this pane is being dragged,
-            // check if pointer moved into another pane's rect
-            let drag_id = pane_id.with("drag_swap");
-            let drag_resp = ui.interact(rect, drag_id, egui::Sense::drag());
-
-            if drag_resp.drag_started() {
-                // Store which pane started dragging
-                ui.data_mut(|d| d.insert_temp(egui::Id::new("dragging_pane"), pane_idx));
-            }
-
-            if drag_resp.dragged() {
-                if let Some(pos) = drag_resp.interact_pointer_pos() {
-                    let dragging_from: Option<usize> =
-                        ui.data(|d| d.get_temp(egui::Id::new("dragging_pane")));
-                    if let Some(from) = dragging_from {
-                        // Find which pane rect the pointer is over
-                        for (target_idx, target_rect) in pane_rects.iter().enumerate() {
-                            if target_idx != from && target_rect.contains(pos) {
-                                swap_target = Some((from, target_idx));
-                                break;
-                            }
-                        }
+        // Draw drag line while a bar handle is being dragged
+        {
+            let from: Option<usize> =
+                ui.data(|d| d.get_temp(egui::Id::new("bar_drag_from")));
+            if from.is_some() {
+                if let Some(origin_pos) =
+                    ui.data(|d| d.get_temp::<egui::Pos2>(egui::Id::new("bar_drag_origin")))
+                {
+                    if let Some(ptr) = ctx.input(|i| i.pointer.hover_pos()) {
+                        ui.painter().line_segment(
+                            [origin_pos, ptr],
+                            egui::Stroke::new(1.5, palette.accent.linear_multiply(0.55)),
+                        );
+                        ctx.request_repaint();
                     }
                 }
             }
+        }
 
-            if drag_resp.drag_stopped() {
-                ui.data_mut(|d| d.remove_by_type::<usize>());
+        // Apply pending rename
+        if let Some((pane_idx, current)) = pending_rename_start {
+            self.renaming_pane = Some((tab_idx, pane_idx));
+            self.pane_rename_buffer = current;
+        }
+        if pending_rename_commit {
+            if let Some((t, p)) = self.renaming_pane {
+                let new_title = self.pane_rename_buffer.trim().to_owned();
+                self.terminal_tabs[t].panes[p].title = new_title;
+            }
+            self.renaming_pane = None;
+        }
+        if pending_rename_cancel {
+            self.renaming_pane = None;
+        }
+
+        // Apply pending focus / swap / close
+        if let Some(pane_idx) = pending_focus {
+            self.terminal_tabs[tab_idx].active_pane = pane_idx;
+        }
+        if let Some((from, to)) = pending_swap {
+            let from_uid = self.terminal_tabs[tab_idx].panes[from].uid;
+            let to_uid = self.terminal_tabs[tab_idx].panes[to].uid;
+            self.terminal_tabs[tab_idx].panes.swap(from, to);
+            let active = self.terminal_tabs[tab_idx].active_pane;
+            if active == from {
+                self.terminal_tabs[tab_idx].active_pane = to;
+            } else if active == to {
+                self.terminal_tabs[tab_idx].active_pane = from;
+            }
+            self.log_debug(format!(
+                "bar_swap: {from}(uid={from_uid}) <-> {to}(uid={to_uid})"
+            ));
+        }
+        if let Some(close_idx) = pending_close {
+            let before = self.terminal_tabs[tab_idx].panes.len();
+            self.terminal_tabs[tab_idx].close_pane(close_idx);
+            self.log_debug(format!(
+                "bar_close: pane {close_idx}, {before} -> {} panes",
+                self.terminal_tabs[tab_idx].panes.len()
+            ));
+            // Cancel rename if it was for the closed pane
+            if self.renaming_pane == Some((tab_idx, close_idx)) {
+                self.renaming_pane = None;
             }
         }
 
@@ -1929,24 +2399,6 @@ impl GhostStickiesApp {
             egui::vec2(total_width, rows as f32 * (pane_height + gap) - gap),
         );
         ui.allocate_rect(grid_rect, egui::Sense::hover());
-
-        // Perform swap if drag landed on another pane
-        if let Some((from, to)) = swap_target {
-            let from_uid = self.terminal_tabs[tab_idx].panes[from].uid;
-            let to_uid = self.terminal_tabs[tab_idx].panes[to].uid;
-            self.terminal_tabs[tab_idx].panes.swap(from, to);
-            // Update active pane to follow the swap
-            let active = self.terminal_tabs[tab_idx].active_pane;
-            if active == from {
-                self.terminal_tabs[tab_idx].active_pane = to;
-            } else if active == to {
-                self.terminal_tabs[tab_idx].active_pane = from;
-            }
-            self.log_debug(format!(
-                "drag_swap: idx {from}(uid={from_uid}) <-> idx {to}(uid={to_uid}), active_pane={}",
-                self.terminal_tabs[tab_idx].active_pane
-            ));
-        }
     }
 
     /// Render the tab bar
@@ -2158,6 +2610,16 @@ impl eframe::App for GhostStickiesApp {
         }
         ctx.request_repaint_after(Duration::from_millis(16));
 
+        // Autosave notes after 1.5 s of inactivity
+        let ti = self.active_terminal;
+        if self.terminal_tabs[ti].notes_dirty {
+            if let Some(t) = self.terminal_tabs[ti].last_type_time {
+                if t.elapsed() > Duration::from_millis(1500) {
+                    self.save_current_note_silent();
+                }
+            }
+        }
+
         if open_new_tab {
             self.add_terminal_tab();
         }
@@ -2221,8 +2683,9 @@ impl eframe::App for GhostStickiesApp {
         }
 
         if insert_checkbox && self.sidebar_open {
-            Self::insert_checkbox_line(&mut self.notes_markdown);
-            self.editing_notes = true;
+            let ti = self.active_terminal;
+            Self::insert_checkbox_line(&mut self.terminal_tabs[ti].notes_markdown);
+            self.terminal_tabs[ti].editing_notes = true;
         }
 
         if toggle_debug {
@@ -2278,6 +2741,15 @@ impl eframe::App for GhostStickiesApp {
                 if drag_response.dragged() {
                     start_drag = true;
                 }
+
+                // Draw "StickyTerminal" centered over the bar (painted before layout so it's behind controls)
+                ui.painter().text(
+                    ui.max_rect().center(),
+                    egui::Align2::CENTER_CENTER,
+                    "StickyTerminal",
+                    egui::FontId::proportional(13.0),
+                    palette.muted_text,
+                );
 
                 ui.horizontal(|ui| {
                     // Traffic light buttons
@@ -2510,11 +2982,14 @@ impl eframe::App for GhostStickiesApp {
                         .inner_margin(egui::Margin::same(12)),
                 )
                 .show(ctx, |ui| {
+                    let ti = self.active_terminal;
                     let mut choose_folder = false;
                     let mut open_note = false;
-                    let mut save_note = false;
                     let mut new_note = false;
-                    let note_text = self
+                    let mut save_note = false;
+                    let mut open_recent_note: Option<PathBuf> = None;
+                    let mut text_edit_changed = false;
+                    let note_text = self.terminal_tabs[ti]
                         .current_note_file
                         .as_ref()
                         .map(|path| {
@@ -2536,12 +3011,19 @@ impl eframe::App for GhostStickiesApp {
                                 .size(16.0)
                                 .color(palette.text),
                         );
+                        if self.terminal_tabs[ti].notes_dirty {
+                            ui.label(
+                                egui::RichText::new("\u{25cf}")
+                                    .small()
+                                    .color(palette.accent.linear_multiply(0.8)),
+                            );
+                        }
 
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
                                 let toggle_label =
-                                    if self.editing_notes { "Preview" } else { "Edit" };
+                                    if self.terminal_tabs[ti].editing_notes { "Preview" } else { "Edit" };
                                 if ui
                                     .add(
                                         egui::Button::new(
@@ -2553,7 +3035,7 @@ impl eframe::App for GhostStickiesApp {
                                     )
                                     .clicked()
                                 {
-                                    self.editing_notes = !self.editing_notes;
+                                    self.terminal_tabs[ti].editing_notes = !self.terminal_tabs[ti].editing_notes;
                                 }
                             },
                         );
@@ -2625,6 +3107,37 @@ impl eframe::App for GhostStickiesApp {
                                             .small()
                                             .color(palette.border),
                                     );
+                                    {
+                                        let recent_copy = self.recent_notes.clone();
+                                        if !recent_copy.is_empty() {
+                                            ui.menu_button(
+                                                egui::RichText::new("Recent")
+                                                    .small()
+                                                    .color(palette.muted_text),
+                                                |ui| {
+                                                    for path in &recent_copy {
+                                                        let name = path
+                                                            .file_name()
+                                                            .and_then(|n| n.to_str())
+                                                            .unwrap_or("?");
+                                                        if ui
+                                                            .selectable_label(false, name)
+                                                            .clicked()
+                                                        {
+                                                            open_recent_note =
+                                                                Some(path.clone());
+                                                            ui.close_menu();
+                                                        }
+                                                    }
+                                                },
+                                            );
+                                            ui.label(
+                                                egui::RichText::new("\u{2022}")
+                                                    .small()
+                                                    .color(palette.border),
+                                            );
+                                        }
+                                    }
                                     if ui
                                         .add(
                                             egui::Button::new(
@@ -2649,16 +3162,25 @@ impl eframe::App for GhostStickiesApp {
                     let content_height = (ui.available_height() - status_height - 8.0).max(100.0);
 
                     Self::note_surface_frame(palette).show(ui, |ui| {
-                        if self.editing_notes {
-                            let editor = egui::TextEdit::multiline(&mut self.notes_markdown)
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(18)
-                                .hint_text("Write markdown here. Cmd+L to add a checkbox.");
-                            ui.add_sized([ui.available_width(), content_height], editor);
+                        if self.terminal_tabs[ti].editing_notes {
+                            egui::ScrollArea::vertical()
+                                .max_height(content_height)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    let r = ui.add(
+                                        egui::TextEdit::multiline(&mut self.terminal_tabs[ti].notes_markdown)
+                                            .desired_width(ui.available_width())
+                                            .desired_rows(40)
+                                            .hint_text("Write markdown here. Cmd+L to add a checkbox."),
+                                    );
+                                    if r.changed() {
+                                        text_edit_changed = true;
+                                    }
+                                });
                         } else {
                             let preview_changed = Self::render_markdown_preview(
                                 ui,
-                                &mut self.notes_markdown,
+                                &mut self.terminal_tabs[ti].notes_markdown,
                                 palette,
                                 content_height,
                             );
@@ -2670,7 +3192,7 @@ impl eframe::App for GhostStickiesApp {
 
                     ui.add_space(4.0);
                     ui.label(
-                        egui::RichText::new(&self.note_status)
+                        egui::RichText::new(&self.terminal_tabs[ti].note_status)
                             .small()
                             .color(palette.muted_text),
                     );
@@ -2689,6 +3211,18 @@ impl eframe::App for GhostStickiesApp {
 
                     if save_note {
                         self.save_current_note();
+                    }
+
+                    if let Some(path) = open_recent_note {
+                        let ti = self.active_terminal;
+                        self.terminal_tabs[ti].current_note_file = Some(path);
+                        self.load_current_note();
+                    }
+
+                    if text_edit_changed {
+                        let ti = self.active_terminal;
+                        self.terminal_tabs[ti].notes_dirty = true;
+                        self.terminal_tabs[ti].last_type_time = Some(std::time::Instant::now());
                     }
                 });
         }
