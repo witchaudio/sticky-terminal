@@ -4,10 +4,10 @@ use eframe::egui;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 use vt100::Parser;
@@ -153,23 +153,23 @@ impl ThemePreset {
     fn palette(self) -> ThemePalette {
         match self {
             Self::Warp => ThemePalette {
-                bg: egui::Color32::from_rgb(20, 20, 28),
-                terminal_bg: egui::Color32::from_rgb(17, 17, 24),
-                sidebar_bg: egui::Color32::from_rgb(24, 24, 33),
-                sidebar_soft_bg: egui::Color32::from_rgb(30, 30, 40),
-                bar_bg: egui::Color32::from_rgb(26, 26, 36),
-                border: egui::Color32::from_rgba_premultiplied(255, 255, 255, 8),
-                text: egui::Color32::from_rgb(229, 229, 236),
-                muted_text: egui::Color32::from_rgb(110, 110, 128),
-                selection: egui::Color32::from_rgba_premultiplied(60, 80, 140, 140),
-                accent: egui::Color32::from_rgb(82, 182, 154),
-                accent_dim: egui::Color32::from_rgb(55, 120, 100),
-                tab_bg: egui::Color32::from_rgb(32, 32, 44),
-                active_tab_bg: egui::Color32::from_rgb(48, 48, 64),
-                tab_text: egui::Color32::from_rgb(140, 140, 158),
-                active_tab_text: egui::Color32::from_rgb(229, 229, 236),
-                input_bg: egui::Color32::from_rgb(28, 28, 38),
-                surface: egui::Color32::from_rgb(34, 34, 46),
+                bg: egui::Color32::from_rgb(0, 0, 0),
+                terminal_bg: egui::Color32::from_rgb(0, 0, 0),
+                sidebar_bg: egui::Color32::from_rgb(6, 6, 8),
+                sidebar_soft_bg: egui::Color32::from_rgb(10, 10, 12),
+                bar_bg: egui::Color32::from_rgb(0, 0, 0),
+                border: egui::Color32::from_rgba_premultiplied(255, 255, 255, 18),
+                text: egui::Color32::from_rgb(250, 250, 252),
+                muted_text: egui::Color32::from_rgb(170, 170, 178),
+                selection: egui::Color32::from_rgba_premultiplied(74, 98, 176, 132),
+                accent: egui::Color32::from_rgb(98, 224, 192),
+                accent_dim: egui::Color32::from_rgb(60, 140, 118),
+                tab_bg: egui::Color32::from_rgb(12, 12, 14),
+                active_tab_bg: egui::Color32::from_rgb(20, 20, 24),
+                tab_text: egui::Color32::from_rgb(180, 180, 188),
+                active_tab_text: egui::Color32::from_rgb(250, 250, 252),
+                input_bg: egui::Color32::from_rgb(8, 8, 10),
+                surface: egui::Color32::from_rgb(14, 14, 18),
             },
             Self::WarpLight => ThemePalette {
                 bg: egui::Color32::from_rgb(14, 24, 42),
@@ -368,6 +368,18 @@ impl TerminalPane {
         self.parser.screen_mut().set_scrollback(rows);
     }
 
+    fn scrollback_position(&self) -> usize {
+        self.parser.screen().scrollback()
+    }
+
+    fn max_scrollback(&mut self) -> usize {
+        let current = self.scrollback_position();
+        self.parser.screen_mut().set_scrollback(usize::MAX);
+        let max = self.parser.screen().scrollback();
+        self.parser.screen_mut().set_scrollback(current.min(max));
+        max
+    }
+
     fn adjust_scrollback(&mut self, delta_rows: i32) {
         let current = self.parser.screen().scrollback() as i32;
         let next = (current + delta_rows).max(0) as usize;
@@ -562,7 +574,8 @@ impl TerminalPane {
                     if !text.is_empty() {
                         self.paste_text(&text);
                     } else {
-                        self.pending_logs.push("img_paste: text empty, trying save_clipboard_image".to_owned());
+                        self.pending_logs
+                            .push("img_paste: text empty, trying save_clipboard_image".to_owned());
                         if let Some(img_path) = save_clipboard_image(&mut self.pending_logs) {
                             let filename = img_path
                                 .file_name()
@@ -580,11 +593,13 @@ impl TerminalPane {
                             } else {
                                 img_path.to_string_lossy().into_owned()
                             };
-                            self.pending_logs.push(format!("img_paste: pasting path: {path_str}"));
+                            self.pending_logs
+                                .push(format!("img_paste: pasting path: {path_str}"));
                             self.paste_chip = Some(filename);
                             self.paste_text(&path_str);
                         } else {
-                            self.pending_logs.push("img_paste: save_clipboard_image returned None".to_owned());
+                            self.pending_logs
+                                .push("img_paste: save_clipboard_image returned None".to_owned());
                         }
                     }
                 }
@@ -606,19 +621,25 @@ impl TerminalPane {
                                 continue;
                             }
                             egui::Key::V => {
-                                self.pending_logs.push("img_paste: Key::V handler fired".to_owned());
+                                self.pending_logs
+                                    .push("img_paste: Key::V handler fired".to_owned());
                                 let text = read_clipboard().filter(|t| !t.is_empty());
                                 if let Some(t) = text {
                                     self.paste_text(&t);
                                 } else {
-                                    self.pending_logs.push("img_paste: no text in clipboard, trying image".to_owned());
-                                    if let Some(img_path) = save_clipboard_image(&mut self.pending_logs) {
+                                    self.pending_logs.push(
+                                        "img_paste: no text in clipboard, trying image".to_owned(),
+                                    );
+                                    if let Some(img_path) =
+                                        save_clipboard_image(&mut self.pending_logs)
+                                    {
                                         let filename = img_path
                                             .file_name()
                                             .and_then(|n| n.to_str())
                                             .unwrap_or("image")
                                             .to_owned();
-                                        let path_str = if let Some(home) = std::env::var_os("HOME") {
+                                        let path_str = if let Some(home) = std::env::var_os("HOME")
+                                        {
                                             let abs = img_path.to_string_lossy();
                                             let home_str = home.to_string_lossy();
                                             if abs.starts_with(home_str.as_ref()) {
@@ -629,7 +650,8 @@ impl TerminalPane {
                                         } else {
                                             img_path.to_string_lossy().into_owned()
                                         };
-                                        self.pending_logs.push(format!("img_paste: pasting path: {path_str}"));
+                                        self.pending_logs
+                                            .push(format!("img_paste: pasting path: {path_str}"));
                                         self.paste_chip = Some(filename);
                                         self.paste_text(&path_str);
                                     }
@@ -798,8 +820,7 @@ impl Drop for TerminalPane {
 // The monitor callback is an Objective-C block. We implement the block ABI
 // manually (a "global block" with no captures) to avoid a new crate dependency.
 
-static CMD_V_PRESSED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static CMD_V_PRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(target_os = "macos")]
 fn install_paste_monitor() {
@@ -831,10 +852,7 @@ fn install_paste_monitor() {
     unsafe impl Sync for GlobalBlock {}
     unsafe impl Send for GlobalBlock {}
 
-    unsafe extern "C" fn invoke(
-        _block: *const GlobalBlock,
-        event: *mut Object,
-    ) -> *mut Object {
+    unsafe extern "C" fn invoke(_block: *const GlobalBlock, event: *mut Object) -> *mut Object {
         let flags: u64 = msg_send![event, modifierFlags];
         let keycode: u16 = msg_send![event, keyCode];
         // kVK_ANSI_V = 9   NSEventModifierFlagCommand = 1 << 20 = 0x100000
@@ -917,10 +935,8 @@ fn save_clipboard_image(log: &mut Vec<String>) -> Option<PathBuf> {
         .map(|d| d.as_millis())
         .unwrap_or(0);
 
-    let desktop = PathBuf::from(
-        std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned()),
-    )
-    .join("Desktop");
+    let desktop =
+        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned())).join("Desktop");
     log.push(format!("img_paste: desktop = {}", desktop.display()));
 
     if let Err(e) = std::fs::create_dir_all(&desktop) {
@@ -929,8 +945,7 @@ fn save_clipboard_image(log: &mut Vec<String>) -> Option<PathBuf> {
     let out_path = desktop.join(format!("pasted-image-{ts}.png"));
 
     unsafe {
-        let pasteboard: *mut Object =
-            msg_send![class!(NSPasteboard), generalPasteboard];
+        let pasteboard: *mut Object = msg_send![class!(NSPasteboard), generalPasteboard];
         if pasteboard.is_null() {
             log.push("img_paste: NSPasteboard is NULL".to_owned());
             return None;
@@ -961,7 +976,10 @@ fn save_clipboard_image(log: &mut Vec<String>) -> Option<PathBuf> {
         log.push(format!("img_paste: NSImage alloc = {:p}", image_alloc));
         let image: *mut Object = msg_send![image_alloc, initWithPasteboard: pasteboard];
         if image.is_null() {
-            log.push("img_paste: NSImage initWithPasteboard returned NULL — no image on clipboard".to_owned());
+            log.push(
+                "img_paste: NSImage initWithPasteboard returned NULL — no image on clipboard"
+                    .to_owned(),
+            );
             return None;
         }
         log.push(format!("img_paste: NSImage OK ({:p})", image));
@@ -974,8 +992,7 @@ fn save_clipboard_image(log: &mut Vec<String>) -> Option<PathBuf> {
         let tiff_len: usize = msg_send![tiff, length];
         log.push(format!("img_paste: TIFF data = {tiff_len} bytes"));
 
-        let rep: *mut Object =
-            msg_send![class!(NSBitmapImageRep), imageRepWithData: tiff];
+        let rep: *mut Object = msg_send![class!(NSBitmapImageRep), imageRepWithData: tiff];
         if rep.is_null() {
             log.push("img_paste: NSBitmapImageRep is NULL — saving raw TIFF".to_owned());
             let ptr: *const u8 = msg_send![tiff, bytes];
@@ -999,17 +1016,16 @@ fn save_clipboard_image(log: &mut Vec<String>) -> Option<PathBuf> {
         let png_data: *mut Object =
             msg_send![rep, representationUsingType: 4usize properties: props];
 
-        let (data_ptr, data_len, path): (*const u8, usize, PathBuf) =
-            if !png_data.is_null() {
-                let len: usize = msg_send![png_data, length];
-                log.push(format!("img_paste: PNG data = {len} bytes"));
-                let ptr: *const u8 = msg_send![png_data, bytes];
-                (ptr, len, out_path)
-            } else {
-                log.push("img_paste: PNG conversion failed — saving raw TIFF".to_owned());
-                let ptr: *const u8 = msg_send![tiff, bytes];
-                (ptr, tiff_len, out_path.with_extension("tiff"))
-            };
+        let (data_ptr, data_len, path): (*const u8, usize, PathBuf) = if !png_data.is_null() {
+            let len: usize = msg_send![png_data, length];
+            log.push(format!("img_paste: PNG data = {len} bytes"));
+            let ptr: *const u8 = msg_send![png_data, bytes];
+            (ptr, len, out_path)
+        } else {
+            log.push("img_paste: PNG conversion failed — saving raw TIFF".to_owned());
+            let ptr: *const u8 = msg_send![tiff, bytes];
+            (ptr, tiff_len, out_path.with_extension("tiff"))
+        };
 
         let bytes = std::slice::from_raw_parts(data_ptr, data_len);
         match std::fs::write(&path, bytes) {
@@ -1264,7 +1280,8 @@ impl GhostStickiesApp {
         };
 
         let Ok(config) = serde_json::from_str::<AppConfig>(&contents) else {
-            self.terminal_tabs[0].note_status = "Could not read saved settings. Using defaults.".to_owned();
+            self.terminal_tabs[0].note_status =
+                "Could not read saved settings. Using defaults.".to_owned();
             return;
         };
 
@@ -1292,7 +1309,8 @@ impl GhostStickiesApp {
 
         let support_dir = Self::app_support_dir();
         if let Err(err) = fs::create_dir_all(&support_dir) {
-            self.terminal_tabs[ti].note_status = format!("Could not create app settings folder: {err}");
+            self.terminal_tabs[ti].note_status =
+                format!("Could not create app settings folder: {err}");
             return;
         }
 
@@ -1326,7 +1344,9 @@ impl GhostStickiesApp {
     }
 
     fn note_file_path(&self) -> Option<PathBuf> {
-        self.terminal_tabs[self.active_terminal].current_note_file.clone()
+        self.terminal_tabs[self.active_terminal]
+            .current_note_file
+            .clone()
     }
 
     fn choose_notes_root(&mut self) {
@@ -1387,7 +1407,10 @@ impl GhostStickiesApp {
     }
 
     fn add_to_recent_notes(&mut self) {
-        if let Some(path) = self.terminal_tabs[self.active_terminal].current_note_file.clone() {
+        if let Some(path) = self.terminal_tabs[self.active_terminal]
+            .current_note_file
+            .clone()
+        {
             self.recent_notes.retain(|p| p != &path);
             self.recent_notes.insert(0, path);
             self.recent_notes.truncate(10);
@@ -1395,7 +1418,9 @@ impl GhostStickiesApp {
     }
 
     fn save_current_note_silent(&mut self) {
-        let Some(path) = self.note_file_path() else { return };
+        let Some(path) = self.note_file_path() else {
+            return;
+        };
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -1409,13 +1434,15 @@ impl GhostStickiesApp {
     fn save_current_note(&mut self) {
         let ti = self.active_terminal;
         let Some(path) = self.note_file_path() else {
-            self.terminal_tabs[ti].note_status = "Choose your notes folder and a note first.".to_owned();
+            self.terminal_tabs[ti].note_status =
+                "Choose your notes folder and a note first.".to_owned();
             return;
         };
 
         if let Some(parent) = path.parent() {
             if let Err(err) = fs::create_dir_all(parent) {
-                self.terminal_tabs[ti].note_status = format!("Could not create note folders: {err}");
+                self.terminal_tabs[ti].note_status =
+                    format!("Could not create note folders: {err}");
                 return;
             }
         }
@@ -1480,7 +1507,8 @@ impl GhostStickiesApp {
         };
 
         if !path.starts_with(&root) {
-            self.terminal_tabs[ti].note_status = "Save the note inside your notes folder.".to_owned();
+            self.terminal_tabs[ti].note_status =
+                "Save the note inside your notes folder.".to_owned();
             return;
         }
 
@@ -1490,7 +1518,8 @@ impl GhostStickiesApp {
             path
         });
         self.terminal_tabs[ti].notes_markdown = "# New note\n\n".to_owned();
-        self.terminal_tabs[ti].note_status = "New note ready. Press Save to write it to disk.".to_owned();
+        self.terminal_tabs[ti].note_status =
+            "New note ready. Press Save to write it to disk.".to_owned();
         self.save_config();
     }
 
@@ -1499,6 +1528,56 @@ impl GhostStickiesApp {
             .fill(palette.surface)
             .corner_radius(egui::CornerRadius::same(8))
             .inner_margin(egui::Margin::same(10))
+    }
+
+    fn note_action_button(label: &str, palette: ThemePalette) -> egui::Button<'static> {
+        egui::Button::new(
+            egui::RichText::new(label.to_owned())
+                .small()
+                .color(palette.muted_text),
+        )
+        .corner_radius(egui::CornerRadius::same(6))
+        .min_size(egui::vec2(0.0, 24.0))
+    }
+
+    fn tab_plus_button(ui: &mut egui::Ui, palette: ThemePalette) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(30.0, 28.0), egui::Sense::click());
+
+        if ui.is_rect_visible(rect) {
+            let fill = if response.is_pointer_button_down_on() {
+                palette.active_tab_bg
+            } else if response.hovered() {
+                palette.tab_bg
+            } else {
+                egui::Color32::TRANSPARENT
+            };
+            let stroke = if response.hovered() {
+                egui::Stroke::new(1.0, palette.border)
+            } else {
+                egui::Stroke::NONE
+            };
+
+            ui.painter().rect(
+                rect,
+                egui::CornerRadius::same(6),
+                fill,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().text(
+                rect.center() + egui::vec2(0.0, -0.5),
+                egui::Align2::CENTER_CENTER,
+                "+",
+                egui::FontId::proportional(16.0),
+                if response.hovered() {
+                    palette.text
+                } else {
+                    palette.muted_text
+                },
+            );
+        }
+
+        response
     }
 
     /// Calculate indent level from leading whitespace (each 2 spaces or 1 tab = 1 level)
@@ -1732,12 +1811,20 @@ impl GhostStickiesApp {
         loop {
             let found = ["https://", "http://", "ftp://"]
                 .iter()
-                .filter_map(|p| row_str[search_from..].find(p).map(|pos| (search_from + pos, *p)))
+                .filter_map(|p| {
+                    row_str[search_from..]
+                        .find(p)
+                        .map(|pos| (search_from + pos, *p))
+                })
                 .min_by_key(|(pos, _)| *pos);
-            let Some((abs_start, prefix)) = found else { break };
+            let Some((abs_start, prefix)) = found else {
+                break;
+            };
             let url_tail = &row_str[abs_start..];
             let url_end = url_tail
-                .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | ']' | '>' | '<'))
+                .find(|c: char| {
+                    c.is_whitespace() || matches!(c, '"' | '\'' | ')' | ']' | '>' | '<')
+                })
                 .unwrap_or(url_tail.len());
             if url_end > prefix.len() {
                 let url = url_tail[..url_end].to_string();
@@ -1821,24 +1908,10 @@ impl GhostStickiesApp {
     #[cfg(not(target_os = "macos"))]
     fn apply_macos_share_privacy(&self, _enabled: bool) {}
 
-    #[cfg(target_os = "macos")]
-    fn toggle_fullscreen() {
-        unsafe {
-            let ns_app_class = class!(NSApplication);
-            let app: *mut Object = msg_send![ns_app_class, sharedApplication];
-            if app.is_null() {
-                return;
-            }
-            let key_window: *mut Object = msg_send![app, keyWindow];
-            if key_window.is_null() {
-                return;
-            }
-            let _: () = msg_send![key_window, toggleFullScreen: std::ptr::null::<Object>()];
-        }
+    fn toggle_fullscreen(ctx: &egui::Context) {
+        let is_fullscreen = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
     }
-
-    #[cfg(not(target_os = "macos"))]
-    fn toggle_fullscreen() {}
 
     fn apply_window_mode(&mut self, ctx: &egui::Context) {
         if self.applied_privacy_mode == Some(self.privacy_mode) {
@@ -2033,6 +2106,10 @@ impl GhostStickiesApp {
         pane_id: egui::Id,
         is_active: bool,
     ) {
+        const DROP_TARGET_ID: &str = "terminal_drop_target";
+        const SCROLLBAR_WIDTH: f32 = 10.0;
+        const SCROLLBAR_GAP: f32 = 6.0;
+
         let frame = egui::Frame::NONE
             .fill(palette.terminal_bg)
             .corner_radius(egui::CornerRadius::same(6))
@@ -2040,9 +2117,26 @@ impl GhostStickiesApp {
 
         frame.show(ui, |ui| {
             let terminal_id = pane_id.with("terminal_surface");
+            let drop_target_id = egui::Id::new(DROP_TARGET_ID);
             let size = ui.available_size();
             let (_, rect) = ui.allocate_space(size);
-            let response = ui.interact(rect, terminal_id, egui::Sense::click_and_drag());
+            let content_rect = egui::Rect::from_min_max(
+                rect.min,
+                egui::pos2(
+                    (rect.max.x - SCROLLBAR_WIDTH - SCROLLBAR_GAP).max(rect.min.x),
+                    rect.max.y,
+                ),
+            );
+            let scrollbar_rect = egui::Rect::from_min_max(
+                egui::pos2(content_rect.max.x + SCROLLBAR_GAP, rect.top() + 4.0),
+                egui::pos2(rect.right(), rect.bottom() - 4.0),
+            );
+            let response = ui.interact(content_rect, terminal_id, egui::Sense::click_and_drag());
+            let scrollbar_response = ui.interact(
+                scrollbar_rect,
+                pane_id.with("terminal_scrollbar"),
+                egui::Sense::click_and_drag(),
+            );
             let hovered_files = ctx.input(|input| input.raw.hovered_files.clone());
             let dropped_files = ctx.input(|input| input.raw.dropped_files.clone());
 
@@ -2054,10 +2148,11 @@ impl GhostStickiesApp {
             let row_height = measure.size().y.max(16.0) + 2.0;
             let inner_padding = 4.0;
 
-            let rows = ((rect.height() - inner_padding * 2.0) / row_height).floor() as u16;
-            let cols = ((rect.width() - inner_padding * 2.0) / char_width).floor() as u16;
+            let rows = ((content_rect.height() - inner_padding * 2.0) / row_height).floor() as u16;
+            let cols = ((content_rect.width() - inner_padding * 2.0) / char_width).floor() as u16;
 
             pane.resize(rows, cols);
+            let max_scrollback = pane.max_scrollback();
 
             let cmd_held = ctx.input(|i| i.modifiers.command);
 
@@ -2065,12 +2160,16 @@ impl GhostStickiesApp {
                 let mut url_opened = false;
                 if cmd_held {
                     if let Some(pos) = response.interact_pointer_pos() {
-                        let point =
-                            pane.cell_from_pos(rect, pos, char_width, row_height, inner_padding);
+                        let point = pane.cell_from_pos(
+                            content_rect,
+                            pos,
+                            char_width,
+                            row_height,
+                            inner_padding,
+                        );
                         let url_to_open = {
                             let screen = pane.parser.screen();
-                            let spans =
-                                Self::find_row_url_spans(screen, point.row, pane.cols);
+                            let spans = Self::find_row_url_spans(screen, point.row, pane.cols);
                             spans
                                 .into_iter()
                                 .find(|(s, e, _)| point.col >= *s && point.col <= *e)
@@ -2091,23 +2190,33 @@ impl GhostStickiesApp {
             if response.drag_started() {
                 response.request_focus();
                 if let Some(pointer_pos) = response.interact_pointer_pos() {
-                    let point =
-                        pane.cell_from_pos(rect, pointer_pos, char_width, row_height, inner_padding);
+                    let point = pane.cell_from_pos(
+                        content_rect,
+                        pointer_pos,
+                        char_width,
+                        row_height,
+                        inner_padding,
+                    );
                     pane.selection = Some((point, point));
                 }
             }
 
             if response.dragged() {
                 if let Some(pointer_pos) = response.interact_pointer_pos() {
-                    let point =
-                        pane.cell_from_pos(rect, pointer_pos, char_width, row_height, inner_padding);
+                    let point = pane.cell_from_pos(
+                        content_rect,
+                        pointer_pos,
+                        char_width,
+                        row_height,
+                        inner_padding,
+                    );
                     if let Some((anchor, _)) = pane.selection {
                         pane.selection = Some((anchor, point));
                     }
                 }
             }
 
-            if response.hovered() {
+            if response.hovered() || scrollbar_response.hovered() {
                 let scroll_delta = ctx.input(|input| input.smooth_scroll_delta.y);
                 if scroll_delta.abs() > f32::EPSILON {
                     let rows_delta = (scroll_delta / row_height).round() as i32;
@@ -2117,7 +2226,15 @@ impl GhostStickiesApp {
                 }
             }
 
-            if response.hovered() && !dropped_files.is_empty() {
+            if !hovered_files.is_empty() && response.hovered() {
+                ui.data_mut(|data| data.insert_temp(drop_target_id, Some(pane_id)));
+            }
+
+            let is_drop_target = ui
+                .data(|data| data.get_temp::<Option<egui::Id>>(drop_target_id).flatten())
+                == Some(pane_id);
+
+            if is_drop_target && !dropped_files.is_empty() {
                 let dropped_paths = dropped_files
                     .iter()
                     .filter_map(|file| {
@@ -2132,8 +2249,22 @@ impl GhostStickiesApp {
                     .collect::<Vec<_>>();
                 if !dropped_paths.is_empty() {
                     response.request_focus();
-                    pane.send_text(&(dropped_paths.join(" ") + " "));
+                    let pasted_paths = dropped_paths.join(" ");
+                    ctx.copy_text(pasted_paths.clone());
+                    pane.paste_text(&(pasted_paths + " "));
+                    pane.status = if dropped_paths.len() == 1 {
+                        "Dropped path copied and pasted.".to_owned()
+                    } else {
+                        format!("{} dropped paths copied and pasted.", dropped_paths.len())
+                    };
                 }
+                ui.data_mut(|data| {
+                    data.remove_temp::<Option<egui::Id>>(drop_target_id);
+                });
+            } else if hovered_files.is_empty() && dropped_files.is_empty() && is_drop_target {
+                ui.data_mut(|data| {
+                    data.remove_temp::<Option<egui::Id>>(drop_target_id);
+                });
             }
 
             pane.has_focus = ui.memory(|memory| memory.has_focus(terminal_id));
@@ -2165,13 +2296,61 @@ impl GhostStickiesApp {
                 );
             }
 
+            if max_scrollback > 0 {
+                let scrollback_offset = pane.scrollback_position();
+                let total_rows = max_scrollback + usize::from(pane.rows.max(1));
+                let visible_ratio = pane.rows as f32 / total_rows as f32;
+                let thumb_height =
+                    (scrollbar_rect.height() * visible_ratio).clamp(28.0, scrollbar_rect.height());
+
+                painter.rect_filled(
+                    scrollbar_rect,
+                    egui::CornerRadius::same(5),
+                    palette.surface.linear_multiply(0.55),
+                );
+
+                let travel = (scrollbar_rect.height() - thumb_height).max(0.0);
+                let thumb_top = if travel <= f32::EPSILON {
+                    scrollbar_rect.top()
+                } else {
+                    scrollbar_rect.top()
+                        + (1.0 - scrollback_offset as f32 / max_scrollback as f32) * travel
+                };
+                let thumb_rect = egui::Rect::from_min_size(
+                    egui::pos2(scrollbar_rect.left(), thumb_top),
+                    egui::vec2(scrollbar_rect.width(), thumb_height),
+                );
+                let thumb_color = if scrollbar_response.dragged() {
+                    palette.accent
+                } else if scrollbar_response.hovered() || scrollback_offset > 0 {
+                    palette.text.linear_multiply(0.72)
+                } else {
+                    palette.muted_text.linear_multiply(0.5)
+                };
+                painter.rect_filled(thumb_rect, egui::CornerRadius::same(5), thumb_color);
+
+                if let Some(pointer_pos) = scrollbar_response.interact_pointer_pos() {
+                    if scrollbar_response.clicked() || scrollbar_response.dragged() {
+                        let travel = (scrollbar_rect.height() - thumb_height).max(1.0);
+                        let thumb_y = (pointer_pos.y - scrollbar_rect.top() - thumb_height * 0.5)
+                            .clamp(0.0, travel);
+                        let top_ratio = thumb_y / travel;
+                        pane.set_scrollback(
+                            ((1.0 - top_ratio) * max_scrollback as f32).round() as usize
+                        );
+                    }
+                }
+            }
+
             let screen = pane.parser.screen();
 
             // Cell position under the pointer (for URL hover highlight).
             let hovered_cell = if cmd_held && response.hovered() {
                 ctx.input(|i| i.pointer.hover_pos())
-                    .filter(|p| rect.contains(*p))
-                    .map(|p| pane.cell_from_pos(rect, p, char_width, row_height, inner_padding))
+                    .filter(|p| content_rect.contains(*p))
+                    .map(|p| {
+                        pane.cell_from_pos(content_rect, p, char_width, row_height, inner_padding)
+                    })
             } else {
                 None
             };
@@ -2194,8 +2373,7 @@ impl GhostStickiesApp {
                     }
 
                     let mut fg = Self::resolve_terminal_color(cell.fgcolor(), palette.text);
-                    let mut bg =
-                        Self::resolve_terminal_color(cell.bgcolor(), palette.terminal_bg);
+                    let mut bg = Self::resolve_terminal_color(cell.bgcolor(), palette.terminal_bg);
 
                     if cell.inverse() {
                         std::mem::swap(&mut fg, &mut bg);
@@ -2211,8 +2389,8 @@ impl GhostStickiesApp {
                         char_width
                     };
                     let min = egui::pos2(
-                        rect.left() + inner_padding + col as f32 * char_width,
-                        rect.top() + inner_padding + row as f32 * row_height,
+                        content_rect.left() + inner_padding + col as f32 * char_width,
+                        content_rect.top() + inner_padding + row as f32 * row_height,
                     );
                     let cell_rect = egui::Rect::from_min_size(
                         min,
@@ -2224,11 +2402,7 @@ impl GhostStickiesApp {
                     }
 
                     if pane.cell_selected(row, col) {
-                        painter.rect_filled(
-                            cell_rect,
-                            egui::CornerRadius::ZERO,
-                            palette.selection,
-                        );
+                        painter.rect_filled(cell_rect, egui::CornerRadius::ZERO, palette.selection);
                     }
 
                     if !cell.has_contents() {
@@ -2258,9 +2432,7 @@ impl GhostStickiesApp {
                         url_spans.iter().find(|(s, e, _)| col >= *s && col <= *e)
                     {
                         let is_hovered = hovered_cell
-                            .map(|hp| {
-                                hp.row == row && hp.col >= *us && hp.col <= *ue
-                            })
+                            .map(|hp| hp.row == row && hp.col >= *us && hp.col <= *ue)
                             .unwrap_or(false);
                         if is_hovered {
                             set_hand_cursor = true;
@@ -2288,8 +2460,8 @@ impl GhostStickiesApp {
 
             let (cursor_row, cursor_col) = screen.cursor_position();
             if pane.has_focus {
-                let x = rect.left() + inner_padding + cursor_col as f32 * char_width;
-                let y = rect.top() + inner_padding + cursor_row as f32 * row_height;
+                let x = content_rect.left() + inner_padding + cursor_col as f32 * char_width;
+                let y = content_rect.top() + inner_padding + cursor_row as f32 * row_height;
                 let cursor_rect = egui::Rect::from_min_size(
                     egui::pos2(x, y),
                     egui::vec2(2.0, (row_height - 2.0).max(12.0)),
@@ -2297,7 +2469,7 @@ impl GhostStickiesApp {
                 painter.rect_filled(cursor_rect, egui::CornerRadius::same(1), palette.accent);
             } else {
                 painter.text(
-                    rect.right_top() + egui::vec2(-10.0, 6.0),
+                    content_rect.right_top() + egui::vec2(-10.0, 6.0),
                     egui::Align2::RIGHT_TOP,
                     "click to focus",
                     egui::TextStyle::Small.resolve(ui.style()),
@@ -2305,7 +2477,7 @@ impl GhostStickiesApp {
                 );
             }
 
-            if response.hovered() && !hovered_files.is_empty() {
+            if is_drop_target && !hovered_files.is_empty() {
                 painter.rect_filled(
                     rect,
                     egui::CornerRadius::same(8),
@@ -2366,8 +2538,7 @@ impl GhostStickiesApp {
                     egui::vec2(22.0, chip_h),
                 );
                 let close_id = pane_id.with("paste_chip_close");
-                let close_resp =
-                    ui.interact(close_rect, close_id, egui::Sense::click());
+                let close_resp = ui.interact(close_rect, close_id, egui::Sense::click());
                 let x_color = if close_resp.hovered() {
                     egui::Color32::from_rgb(220, 80, 80)
                 } else {
@@ -2420,7 +2591,9 @@ impl GhostStickiesApp {
             let pane = &mut self.terminal_tabs[tab_idx].panes[0];
             Self::render_pane(pane, ui, palette, ctx, pane_id, true);
             let logs = std::mem::take(&mut self.terminal_tabs[tab_idx].panes[0].pending_logs);
-            for msg in logs { self.log_debug(msg); }
+            for msg in logs {
+                self.log_debug(msg);
+            }
             return;
         }
 
@@ -2459,10 +2632,8 @@ impl GhostStickiesApp {
             for col in 1..panes_in_row {
                 let x = origin.x + col as f32 * (pane_width + gap) - gap;
                 let y_top = origin.y + row as f32 * (pane_height + gap);
-                let sep_rect = egui::Rect::from_min_size(
-                    egui::pos2(x, y_top),
-                    egui::vec2(gap, pane_height),
-                );
+                let sep_rect =
+                    egui::Rect::from_min_size(egui::pos2(x, y_top), egui::vec2(gap, pane_height));
                 painter.rect_filled(sep_rect, egui::CornerRadius::ZERO, palette.border);
             }
 
@@ -2494,10 +2665,8 @@ impl GhostStickiesApp {
             let pane_id = ui.id().with(("pane_uid", pane_uid));
 
             // Split full rect into bar + content
-            let bar_rect = egui::Rect::from_min_size(
-                full_rect.min,
-                egui::vec2(full_rect.width(), BAR_H),
-            );
+            let bar_rect =
+                egui::Rect::from_min_size(full_rect.min, egui::vec2(full_rect.width(), BAR_H));
             let content_rect = egui::Rect::from_min_max(
                 egui::pos2(full_rect.min.x, full_rect.min.y + BAR_H),
                 full_rect.max,
@@ -2509,7 +2678,8 @@ impl GhostStickiesApp {
             } else {
                 palette.bar_bg
             };
-            ui.painter().rect_filled(bar_rect, egui::CornerRadius::ZERO, bar_bg);
+            ui.painter()
+                .rect_filled(bar_rect, egui::CornerRadius::ZERO, bar_bg);
 
             // Drag handle (left side) — click focuses pane, drag swaps
             let handle_rect = egui::Rect::from_min_size(
@@ -2552,8 +2722,7 @@ impl GhostStickiesApp {
                 });
             }
             if handle_resp.drag_stopped() {
-                let from: Option<usize> =
-                    ui.data(|d| d.get_temp(egui::Id::new("bar_drag_from")));
+                let from: Option<usize> = ui.data(|d| d.get_temp(egui::Id::new("bar_drag_from")));
                 if let Some(from_idx) = from {
                     if let Some(pos) = handle_resp.interact_pointer_pos() {
                         for (to_idx, to_rect) in pane_rects.iter().enumerate() {
@@ -2604,9 +2773,8 @@ impl GhostStickiesApp {
             if is_renaming {
                 // Inline text edit for rename
                 let rename_id = pane_id.with("bar_rename_edit");
-                let mut rename_ui = ui.new_child(
-                    egui::UiBuilder::new().max_rect(title_rect.shrink(2.0)),
-                );
+                let mut rename_ui =
+                    ui.new_child(egui::UiBuilder::new().max_rect(title_rect.shrink(2.0)));
                 let edit_resp = rename_ui.add(
                     egui::TextEdit::singleline(&mut self.pane_rename_buffer)
                         .id(rename_id)
@@ -2662,8 +2830,11 @@ impl GhostStickiesApp {
 
             let pane = &mut self.terminal_tabs[tab_idx].panes[pane_idx];
             Self::render_pane(pane, &mut child_ui, palette, ctx, pane_id, is_active);
-            let logs = std::mem::take(&mut self.terminal_tabs[tab_idx].panes[pane_idx].pending_logs);
-            for msg in logs { self.log_debug(msg); }
+            let logs =
+                std::mem::take(&mut self.terminal_tabs[tab_idx].panes[pane_idx].pending_logs);
+            for msg in logs {
+                self.log_debug(msg);
+            }
 
             if self.terminal_tabs[tab_idx].panes[pane_idx].has_focus && !is_active {
                 let old_active = self.terminal_tabs[tab_idx].active_pane;
@@ -2677,8 +2848,7 @@ impl GhostStickiesApp {
 
         // Draw drag line while a bar handle is being dragged
         {
-            let from: Option<usize> =
-                ui.data(|d| d.get_temp(egui::Id::new("bar_drag_from")));
+            let from: Option<usize> = ui.data(|d| d.get_temp(egui::Id::new("bar_drag_from")));
             if from.is_some() {
                 if let Some(origin_pos) =
                     ui.data(|d| d.get_temp::<egui::Pos2>(egui::Id::new("bar_drag_origin")))
@@ -2838,10 +3008,7 @@ impl GhostStickiesApp {
                     }
 
                     if ui
-                        .add_enabled(
-                            self.terminal_tabs.len() > 1,
-                            egui::Button::new("Close"),
-                        )
+                        .add_enabled(self.terminal_tabs.len() > 1, egui::Button::new("Close"))
                         .clicked()
                     {
                         close_tab = Some(index);
@@ -2863,13 +3030,7 @@ impl GhostStickiesApp {
             }
 
             ui.add_space(4.0);
-            let plus_btn = ui.add(
-                egui::Button::new(
-                    egui::RichText::new("+").size(16.0).color(palette.muted_text),
-                )
-                .frame(false)
-                .min_size(egui::vec2(28.0, 28.0)),
-            );
+            let plus_btn = Self::tab_plus_button(ui, palette);
             if plus_btn.clicked() {
                 self.add_terminal_tab();
             }
@@ -2909,17 +3070,13 @@ impl eframe::App for GhostStickiesApp {
             // CMD_V_PRESSED is set by the low-level NSEvent monitor in install_paste_monitor().
             // It fires even when macOS suppresses the Cmd+V key event from reaching egui
             // (which happens when the clipboard contains only image data).
-            let nsevent_cmd_v =
-                CMD_V_PRESSED.swap(false, std::sync::atomic::Ordering::Relaxed);
+            let nsevent_cmd_v = CMD_V_PRESSED.swap(false, std::sync::atomic::Ordering::Relaxed);
 
             // Also watch for egui-level paste events (text paste path).
             let all_events = ctx.input(|i| i.events.clone());
             for e in &all_events {
                 if let egui::Event::Paste(t) = e {
-                    self.log_debug(format!(
-                        "app_paste: Event::Paste text.len()={}",
-                        t.len()
-                    ));
+                    self.log_debug(format!("app_paste: Event::Paste text.len()={}", t.len()));
                 }
             }
             if nsevent_cmd_v {
@@ -2929,9 +3086,7 @@ impl eframe::App for GhostStickiesApp {
             // Only attempt image paste when Cmd+V came from the low-level monitor
             // AND there is no text in the clipboard (image-only case).
             if nsevent_cmd_v {
-                let has_text = read_clipboard()
-                    .map(|t| !t.is_empty())
-                    .unwrap_or(false);
+                let has_text = read_clipboard().map(|t| !t.is_empty()).unwrap_or(false);
                 self.log_debug(format!("app_paste: has_text={has_text}"));
 
                 if !has_text {
@@ -2979,12 +3134,10 @@ impl eframe::App for GhostStickiesApp {
         let close_pane = ctx.input(|input| {
             input.modifiers.command && input.modifiers.shift && input.key_pressed(egui::Key::D)
         });
-        let next_pane = ctx.input(|input| {
-            input.modifiers.command && input.key_pressed(egui::Key::CloseBracket)
-        });
-        let prev_pane = ctx.input(|input| {
-            input.modifiers.command && input.key_pressed(egui::Key::OpenBracket)
-        });
+        let next_pane = ctx
+            .input(|input| input.modifiers.command && input.key_pressed(egui::Key::CloseBracket));
+        let prev_pane =
+            ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::OpenBracket));
         // Cmd+Shift+Arrow to move/swap the active pane in the grid
         let move_pane_left = ctx.input(|input| {
             input.modifiers.command
@@ -3007,9 +3160,7 @@ impl eframe::App for GhostStickiesApp {
                 && input.key_pressed(egui::Key::ArrowDown)
         });
         let toggle_debug = ctx.input(|input| {
-            input.modifiers.command
-                && input.modifiers.shift
-                && input.key_pressed(egui::Key::L)
+            input.modifiers.command && input.modifiers.shift && input.key_pressed(egui::Key::L)
         });
 
         let mut received_output = false;
@@ -3041,13 +3192,19 @@ impl eframe::App for GhostStickiesApp {
         if split_pane && !close_pane {
             let uid = self.alloc_pane_uid();
             self.active_tab_mut().split_pane(uid);
-            self.log_debug(format!("split_pane: new pane_uid={uid}, total_panes={}", self.active_tab().panes.len()));
+            self.log_debug(format!(
+                "split_pane: new pane_uid={uid}, total_panes={}",
+                self.active_tab().panes.len()
+            ));
         }
 
         if close_pane {
             let before = self.active_tab().panes.len();
             self.active_tab_mut().close_active_pane();
-            self.log_debug(format!("close_pane: {before} -> {} panes", self.active_tab().panes.len()));
+            self.log_debug(format!(
+                "close_pane: {before} -> {} panes",
+                self.active_tab().panes.len()
+            ));
         }
 
         if next_pane {
@@ -3215,7 +3372,7 @@ impl eframe::App for GhostStickiesApp {
                     ui.painter()
                         .circle_filled(max_rect.center(), 6.0, max_color);
                     if max_resp.clicked() {
-                        Self::toggle_fullscreen();
+                        Self::toggle_fullscreen(ctx);
                     }
 
                     ui.add_space(16.0);
@@ -3229,7 +3386,9 @@ impl eframe::App for GhostStickiesApp {
                     if ui
                         .add(
                             egui::Button::new(
-                                egui::RichText::new("|||").size(11.0).color(sidebar_icon_color),
+                                egui::RichText::new("|||")
+                                    .size(11.0)
+                                    .color(sidebar_icon_color),
                             )
                             .frame(false),
                         )
@@ -3361,8 +3520,7 @@ impl eframe::App for GhostStickiesApp {
                     .inner_margin(egui::Margin::symmetric(10, 4)),
             )
             .show(ctx, |ui| {
-                let (switch_to, close_tab, rename_tab, move_tab) =
-                    self.render_tab_bar(ui, palette);
+                let (switch_to, close_tab, rename_tab, move_tab) = self.render_tab_bar(ui, palette);
 
                 if let Some((from, to)) = move_tab {
                     self.move_terminal_tab(from, to);
@@ -3430,26 +3588,20 @@ impl eframe::App for GhostStickiesApp {
                             );
                         }
 
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                let toggle_label =
-                                    if self.terminal_tabs[ti].editing_notes { "Preview" } else { "Edit" };
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            egui::RichText::new(toggle_label)
-                                                .small()
-                                                .color(palette.muted_text),
-                                        )
-                                        .frame(false),
-                                    )
-                                    .clicked()
-                                {
-                                    self.terminal_tabs[ti].editing_notes = !self.terminal_tabs[ti].editing_notes;
-                                }
-                            },
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let toggle_label = if self.terminal_tabs[ti].editing_notes {
+                                "Preview"
+                            } else {
+                                "Edit"
+                            };
+                            if ui
+                                .add(Self::note_action_button(toggle_label, palette))
+                                .clicked()
+                            {
+                                self.terminal_tabs[ti].editing_notes =
+                                    !self.terminal_tabs[ti].editing_notes;
+                            }
+                        });
                     });
                     ui.add_space(4.0);
 
@@ -3464,67 +3616,23 @@ impl eframe::App for GhostStickiesApp {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui
-                                        .add(
-                                            egui::Button::new(
-                                                egui::RichText::new("Save")
-                                                    .small()
-                                                    .color(palette.muted_text),
-                                            )
-                                            .frame(false),
-                                        )
-                                        .clicked()
-                                    {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+
+                                    if ui.add(Self::note_action_button("Save", palette)).clicked() {
                                         save_note = true;
                                     }
-                                    ui.label(
-                                        egui::RichText::new("\u{2022}")
-                                            .small()
-                                            .color(palette.border),
-                                    );
-                                    if ui
-                                        .add(
-                                            egui::Button::new(
-                                                egui::RichText::new("New")
-                                                    .small()
-                                                    .color(palette.muted_text),
-                                            )
-                                            .frame(false),
-                                        )
-                                        .clicked()
-                                    {
+                                    if ui.add(Self::note_action_button("New", palette)).clicked() {
                                         new_note = true;
                                     }
-                                    ui.label(
-                                        egui::RichText::new("\u{2022}")
-                                            .small()
-                                            .color(palette.border),
-                                    );
-                                    if ui
-                                        .add(
-                                            egui::Button::new(
-                                                egui::RichText::new("Open")
-                                                    .small()
-                                                    .color(palette.muted_text),
-                                            )
-                                            .frame(false),
-                                        )
-                                        .clicked()
-                                    {
+                                    if ui.add(Self::note_action_button("Open", palette)).clicked() {
                                         open_note = true;
                                     }
-                                    ui.label(
-                                        egui::RichText::new("\u{2022}")
-                                            .small()
-                                            .color(palette.border),
-                                    );
                                     {
                                         let recent_copy = self.recent_notes.clone();
                                         if !recent_copy.is_empty() {
-                                            ui.menu_button(
-                                                egui::RichText::new("Recent")
-                                                    .small()
-                                                    .color(palette.muted_text),
+                                            egui::menu::menu_custom_button(
+                                                ui,
+                                                Self::note_action_button("Recent", palette),
                                                 |ui| {
                                                     for path in &recent_copy {
                                                         let name = path
@@ -3535,29 +3643,16 @@ impl eframe::App for GhostStickiesApp {
                                                             .selectable_label(false, name)
                                                             .clicked()
                                                         {
-                                                            open_recent_note =
-                                                                Some(path.clone());
-                                                            ui.close_menu();
+                                                            open_recent_note = Some(path.clone());
+                                                            ui.close();
                                                         }
                                                     }
                                                 },
                                             );
-                                            ui.label(
-                                                egui::RichText::new("\u{2022}")
-                                                    .small()
-                                                    .color(palette.border),
-                                            );
                                         }
                                     }
                                     if ui
-                                        .add(
-                                            egui::Button::new(
-                                                egui::RichText::new("Folder")
-                                                    .small()
-                                                    .color(palette.muted_text),
-                                            )
-                                            .frame(false),
-                                        )
+                                        .add(Self::note_action_button("Folder", palette))
                                         .clicked()
                                     {
                                         choose_folder = true;
@@ -3579,10 +3674,12 @@ impl eframe::App for GhostStickiesApp {
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
                                     let r = ui.add(
-                                        egui::TextEdit::multiline(&mut self.terminal_tabs[ti].notes_markdown)
-                                            .desired_width(ui.available_width())
-                                            .desired_rows(40)
-                                            .hint_text("Write markdown here. Cmd+L to add a checkbox."),
+                                        egui::TextEdit::multiline(
+                                            &mut self.terminal_tabs[ti].notes_markdown,
+                                        )
+                                        .desired_width(ui.available_width())
+                                        .desired_rows(40)
+                                        .hint_text("Write markdown here. Cmd+L to add a checkbox."),
                                     );
                                     if r.changed() {
                                         text_edit_changed = true;
