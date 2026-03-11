@@ -77,6 +77,8 @@ struct TerminalPane {
     status: String,
     has_focus: bool,
     selection: Option<(TerminalPoint, TerminalPoint)>,
+    paste_chip: Option<String>, // filename shown in chip
+    pending_logs: Vec<String>,
 }
 
 // ── A tab containing one or more panes ──
@@ -251,6 +253,8 @@ impl TerminalPane {
             status: "Starting shell...".to_owned(),
             has_focus: false,
             selection: None,
+            paste_chip: None,
+            pending_logs: Vec::new(),
         }
     }
 
@@ -551,7 +555,38 @@ impl TerminalPane {
                     }
                 }
                 egui::Event::Paste(text) => {
-                    self.paste_text(&text);
+                    self.pending_logs.push(format!(
+                        "img_paste: Event::Paste fired, text.len()={}",
+                        text.len()
+                    ));
+                    if !text.is_empty() {
+                        self.paste_text(&text);
+                    } else {
+                        self.pending_logs.push("img_paste: text empty, trying save_clipboard_image".to_owned());
+                        if let Some(img_path) = save_clipboard_image(&mut self.pending_logs) {
+                            let filename = img_path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("image")
+                                .to_owned();
+                            let path_str = if let Some(home) = std::env::var_os("HOME") {
+                                let abs = img_path.to_string_lossy();
+                                let home_str = home.to_string_lossy();
+                                if abs.starts_with(home_str.as_ref()) {
+                                    format!("~{}", &abs[home_str.len()..])
+                                } else {
+                                    abs.into_owned()
+                                }
+                            } else {
+                                img_path.to_string_lossy().into_owned()
+                            };
+                            self.pending_logs.push(format!("img_paste: pasting path: {path_str}"));
+                            self.paste_chip = Some(filename);
+                            self.paste_text(&path_str);
+                        } else {
+                            self.pending_logs.push("img_paste: save_clipboard_image returned None".to_owned());
+                        }
+                    }
                 }
                 egui::Event::Key {
                     key,
@@ -571,8 +606,33 @@ impl TerminalPane {
                                 continue;
                             }
                             egui::Key::V => {
-                                if let Some(text) = read_clipboard() {
-                                    self.paste_text(&text);
+                                self.pending_logs.push("img_paste: Key::V handler fired".to_owned());
+                                let text = read_clipboard().filter(|t| !t.is_empty());
+                                if let Some(t) = text {
+                                    self.paste_text(&t);
+                                } else {
+                                    self.pending_logs.push("img_paste: no text in clipboard, trying image".to_owned());
+                                    if let Some(img_path) = save_clipboard_image(&mut self.pending_logs) {
+                                        let filename = img_path
+                                            .file_name()
+                                            .and_then(|n| n.to_str())
+                                            .unwrap_or("image")
+                                            .to_owned();
+                                        let path_str = if let Some(home) = std::env::var_os("HOME") {
+                                            let abs = img_path.to_string_lossy();
+                                            let home_str = home.to_string_lossy();
+                                            if abs.starts_with(home_str.as_ref()) {
+                                                format!("~{}", &abs[home_str.len()..])
+                                            } else {
+                                                abs.into_owned()
+                                            }
+                                        } else {
+                                            img_path.to_string_lossy().into_owned()
+                                        };
+                                        self.pending_logs.push(format!("img_paste: pasting path: {path_str}"));
+                                        self.paste_chip = Some(filename);
+                                        self.paste_text(&path_str);
+                                    }
                                 }
                                 continue;
                             }
@@ -727,6 +787,96 @@ impl Drop for TerminalPane {
     }
 }
 
+// ── Low-level Cmd+V detection via NSEvent local monitor ─────────────────────
+//
+// macOS routes Cmd+V through the `paste:` responder action. For text on the
+// clipboard that generates Event::Paste in egui. For image-only clipboard
+// content the action finds no text and egui sees *nothing*. We install an
+// NSEvent local key-down monitor that fires before any responder processing,
+// so we can detect Cmd+V independently of clipboard content.
+//
+// The monitor callback is an Objective-C block. We implement the block ABI
+// manually (a "global block" with no captures) to avoid a new crate dependency.
+
+static CMD_V_PRESSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
+fn install_paste_monitor() {
+    use std::sync::OnceLock;
+
+    extern "C" {
+        // Linker symbol; value is the vtable pointer for global ObjC blocks.
+        static _NSConcreteGlobalBlock: std::ffi::c_void;
+    }
+
+    #[repr(C)]
+    struct BlockDescriptor {
+        reserved: u64,
+        size: u64,
+    }
+
+    // Matches the Clang block ABI layout for a block with no captured variables.
+    #[repr(C)]
+    struct GlobalBlock {
+        isa: *const std::ffi::c_void,
+        flags: i32,
+        reserved: i32,
+        invoke: unsafe extern "C" fn(*const GlobalBlock, *mut Object) -> *mut Object,
+        descriptor: *const BlockDescriptor,
+    }
+
+    // SAFETY: the block is never mutated after creation and lives for the entire
+    // process lifetime.
+    unsafe impl Sync for GlobalBlock {}
+    unsafe impl Send for GlobalBlock {}
+
+    unsafe extern "C" fn invoke(
+        _block: *const GlobalBlock,
+        event: *mut Object,
+    ) -> *mut Object {
+        let flags: u64 = msg_send![event, modifierFlags];
+        let keycode: u16 = msg_send![event, keyCode];
+        // kVK_ANSI_V = 9   NSEventModifierFlagCommand = 1 << 20 = 0x100000
+        if keycode == 9 && (flags & 0x100000) != 0 {
+            CMD_V_PRESSED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        event
+    }
+
+    static DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+        reserved: 0,
+        size: std::mem::size_of::<GlobalBlock>() as u64,
+    };
+
+    static BLOCK: OnceLock<GlobalBlock> = OnceLock::new();
+
+    let block = BLOCK.get_or_init(|| unsafe {
+        GlobalBlock {
+            isa: &_NSConcreteGlobalBlock as *const _ as *const std::ffi::c_void,
+            flags: 0x10000000i32, // BLOCK_IS_GLOBAL
+            reserved: 0,
+            invoke,
+            descriptor: &DESCRIPTOR,
+        }
+    });
+
+    unsafe {
+        // NSEventMaskKeyDown = 1 << 10
+        let monitor: *mut Object = msg_send![
+            class!(NSEvent),
+            addLocalMonitorForEventsMatchingMask: (1u64 << 10)
+            handler: block as *const GlobalBlock
+        ];
+        // The monitor is retained internally by NSEvent; we intentionally
+        // let this object live forever (app lifetime).
+        std::mem::forget(monitor);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_paste_monitor() {}
+
 #[cfg(target_os = "macos")]
 fn read_clipboard() -> Option<String> {
     unsafe {
@@ -754,6 +904,130 @@ fn read_clipboard() -> Option<String> {
 
 #[cfg(not(target_os = "macos"))]
 fn read_clipboard() -> Option<String> {
+    None
+}
+
+/// Save clipboard image to ~/Desktop/pasted-image-{ts}.png.
+/// Logs every step into `log` so failures are visible in the debug window.
+#[cfg(target_os = "macos")]
+fn save_clipboard_image(log: &mut Vec<String>) -> Option<PathBuf> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
+    let desktop = PathBuf::from(
+        std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned()),
+    )
+    .join("Desktop");
+    log.push(format!("img_paste: desktop = {}", desktop.display()));
+
+    if let Err(e) = std::fs::create_dir_all(&desktop) {
+        log.push(format!("img_paste: create_dir_all failed: {e}"));
+    }
+    let out_path = desktop.join(format!("pasted-image-{ts}.png"));
+
+    unsafe {
+        let pasteboard: *mut Object =
+            msg_send![class!(NSPasteboard), generalPasteboard];
+        if pasteboard.is_null() {
+            log.push("img_paste: NSPasteboard is NULL".to_owned());
+            return None;
+        }
+        log.push("img_paste: NSPasteboard OK".to_owned());
+
+        // Log available pasteboard types
+        let types: *mut Object = msg_send![pasteboard, types];
+        if !types.is_null() {
+            let count: usize = msg_send![types, count];
+            log.push(format!("img_paste: pasteboard has {count} types"));
+            for i in 0..count.min(10) {
+                let t: *mut Object = msg_send![types, objectAtIndex: i];
+                if !t.is_null() {
+                    let utf8: *const std::os::raw::c_char = msg_send![t, UTF8String];
+                    if !utf8.is_null() {
+                        let s = std::ffi::CStr::from_ptr(utf8).to_string_lossy();
+                        log.push(format!("img_paste:   type[{i}] = {s}"));
+                    }
+                }
+            }
+        } else {
+            log.push("img_paste: pasteboard.types is NULL".to_owned());
+        }
+
+        // Try NSImage initWithPasteboard
+        let image_alloc: *mut Object = msg_send![class!(NSImage), alloc];
+        log.push(format!("img_paste: NSImage alloc = {:p}", image_alloc));
+        let image: *mut Object = msg_send![image_alloc, initWithPasteboard: pasteboard];
+        if image.is_null() {
+            log.push("img_paste: NSImage initWithPasteboard returned NULL — no image on clipboard".to_owned());
+            return None;
+        }
+        log.push(format!("img_paste: NSImage OK ({:p})", image));
+
+        let tiff: *mut Object = msg_send![image, TIFFRepresentation];
+        if tiff.is_null() {
+            log.push("img_paste: TIFFRepresentation is NULL".to_owned());
+            return None;
+        }
+        let tiff_len: usize = msg_send![tiff, length];
+        log.push(format!("img_paste: TIFF data = {tiff_len} bytes"));
+
+        let rep: *mut Object =
+            msg_send![class!(NSBitmapImageRep), imageRepWithData: tiff];
+        if rep.is_null() {
+            log.push("img_paste: NSBitmapImageRep is NULL — saving raw TIFF".to_owned());
+            let ptr: *const u8 = msg_send![tiff, bytes];
+            let bytes = std::slice::from_raw_parts(ptr, tiff_len);
+            let tiff_path = out_path.with_extension("tiff");
+            return match std::fs::write(&tiff_path, bytes) {
+                Ok(_) => {
+                    log.push(format!("img_paste: saved TIFF to {}", tiff_path.display()));
+                    Some(tiff_path)
+                }
+                Err(e) => {
+                    log.push(format!("img_paste: fs::write TIFF failed: {e}"));
+                    None
+                }
+            };
+        }
+        log.push("img_paste: NSBitmapImageRep OK".to_owned());
+
+        // NSBitmapImageFileTypePNG = 4
+        let props: *mut Object = msg_send![class!(NSDictionary), dictionary];
+        let png_data: *mut Object =
+            msg_send![rep, representationUsingType: 4usize properties: props];
+
+        let (data_ptr, data_len, path): (*const u8, usize, PathBuf) =
+            if !png_data.is_null() {
+                let len: usize = msg_send![png_data, length];
+                log.push(format!("img_paste: PNG data = {len} bytes"));
+                let ptr: *const u8 = msg_send![png_data, bytes];
+                (ptr, len, out_path)
+            } else {
+                log.push("img_paste: PNG conversion failed — saving raw TIFF".to_owned());
+                let ptr: *const u8 = msg_send![tiff, bytes];
+                (ptr, tiff_len, out_path.with_extension("tiff"))
+            };
+
+        let bytes = std::slice::from_raw_parts(data_ptr, data_len);
+        match std::fs::write(&path, bytes) {
+            Ok(_) => {
+                log.push(format!("img_paste: saved to {}", path.display()));
+                Some(path)
+            }
+            Err(e) => {
+                log.push(format!("img_paste: fs::write failed: {e}"));
+                None
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn save_clipboard_image(log: &mut Vec<String>) -> Option<PathBuf> {
+    log.push("img_paste: save_clipboard_image — not macOS".to_owned());
     None
 }
 
@@ -936,6 +1210,8 @@ impl GhostStickiesApp {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         let fonts = egui::FontDefinitions::default();
         cc.egui_ctx.set_fonts(fonts);
+
+        install_paste_monitor();
 
         let mut app = Self::default();
         app.load_saved_config();
@@ -2043,6 +2319,74 @@ impl GhostStickiesApp {
                     palette.text,
                 );
             }
+
+            // ── Paste-image chip overlay ─────────────────────────────────
+            let chip_dismiss = if let Some(ref filename) = pane.paste_chip {
+                let font = egui::FontId::proportional(12.0);
+                let label = format!("\u{1F5BC} {filename}");
+                let text_width = painter
+                    .layout_no_wrap(label.clone(), font.clone(), egui::Color32::WHITE)
+                    .size()
+                    .x;
+                let chip_w = text_width + 20.0 + 20.0; // text + padding + close btn
+                let chip_h = 26.0;
+                let chip_margin = 8.0;
+                // Position at bottom-left so it doesn't cover terminal output
+                let chip_rect = egui::Rect::from_min_size(
+                    egui::pos2(
+                        rect.left() + chip_margin,
+                        rect.bottom() - chip_margin - chip_h,
+                    ),
+                    egui::vec2(chip_w, chip_h),
+                );
+
+                let chip_bg = egui::Color32::from_rgb(40, 42, 56);
+                let chip_border = egui::Color32::from_rgb(100, 105, 140);
+                let text_color = egui::Color32::from_rgb(210, 215, 235);
+                let close_color = egui::Color32::from_rgb(160, 160, 180);
+
+                painter.rect(
+                    chip_rect,
+                    egui::CornerRadius::same(6),
+                    chip_bg,
+                    egui::Stroke::new(1.0, chip_border),
+                    egui::StrokeKind::Outside,
+                );
+                painter.text(
+                    egui::pos2(chip_rect.left() + 8.0, chip_rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    &label,
+                    font,
+                    text_color,
+                );
+
+                // × close button
+                let close_rect = egui::Rect::from_min_size(
+                    egui::pos2(chip_rect.right() - 22.0, chip_rect.top()),
+                    egui::vec2(22.0, chip_h),
+                );
+                let close_id = pane_id.with("paste_chip_close");
+                let close_resp =
+                    ui.interact(close_rect, close_id, egui::Sense::click());
+                let x_color = if close_resp.hovered() {
+                    egui::Color32::from_rgb(220, 80, 80)
+                } else {
+                    close_color
+                };
+                painter.text(
+                    close_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "×",
+                    egui::FontId::proportional(14.0),
+                    x_color,
+                );
+                close_resp.clicked()
+            } else {
+                false
+            };
+            if chip_dismiss {
+                pane.paste_chip = None;
+            }
         });
     }
 
@@ -2075,6 +2419,8 @@ impl GhostStickiesApp {
             let pane_id = ui.id().with(("pane_uid", pane_uid));
             let pane = &mut self.terminal_tabs[tab_idx].panes[0];
             Self::render_pane(pane, ui, palette, ctx, pane_id, true);
+            let logs = std::mem::take(&mut self.terminal_tabs[tab_idx].panes[0].pending_logs);
+            for msg in logs { self.log_debug(msg); }
             return;
         }
 
@@ -2316,8 +2662,10 @@ impl GhostStickiesApp {
 
             let pane = &mut self.terminal_tabs[tab_idx].panes[pane_idx];
             Self::render_pane(pane, &mut child_ui, palette, ctx, pane_id, is_active);
+            let logs = std::mem::take(&mut self.terminal_tabs[tab_idx].panes[pane_idx].pending_logs);
+            for msg in logs { self.log_debug(msg); }
 
-            if pane.has_focus && !is_active {
+            if self.terminal_tabs[tab_idx].panes[pane_idx].has_focus && !is_active {
                 let old_active = self.terminal_tabs[tab_idx].active_pane;
                 self.terminal_tabs[tab_idx].active_pane = pane_idx;
                 self.log_debug(format!(
@@ -2556,6 +2904,72 @@ impl eframe::App for GhostStickiesApp {
 
         self.apply_window_mode(ctx);
 
+        // ── App-level paste detection (runs regardless of pane focus state) ──
+        {
+            // CMD_V_PRESSED is set by the low-level NSEvent monitor in install_paste_monitor().
+            // It fires even when macOS suppresses the Cmd+V key event from reaching egui
+            // (which happens when the clipboard contains only image data).
+            let nsevent_cmd_v =
+                CMD_V_PRESSED.swap(false, std::sync::atomic::Ordering::Relaxed);
+
+            // Also watch for egui-level paste events (text paste path).
+            let all_events = ctx.input(|i| i.events.clone());
+            for e in &all_events {
+                if let egui::Event::Paste(t) = e {
+                    self.log_debug(format!(
+                        "app_paste: Event::Paste text.len()={}",
+                        t.len()
+                    ));
+                }
+            }
+            if nsevent_cmd_v {
+                self.log_debug("app_paste: NSEvent Cmd+V detected".to_owned());
+            }
+
+            // Only attempt image paste when Cmd+V came from the low-level monitor
+            // AND there is no text in the clipboard (image-only case).
+            if nsevent_cmd_v {
+                let has_text = read_clipboard()
+                    .map(|t| !t.is_empty())
+                    .unwrap_or(false);
+                self.log_debug(format!("app_paste: has_text={has_text}"));
+
+                if !has_text {
+                    self.log_debug("app_paste: no text → save_clipboard_image".to_owned());
+                    let mut img_logs: Vec<String> = Vec::new();
+                    let ti = self.active_terminal;
+                    let pi = self.terminal_tabs[ti].active_pane;
+                    if let Some(img_path) = save_clipboard_image(&mut img_logs) {
+                        let filename = img_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("image")
+                            .to_owned();
+                        // Shorten path for terminal display: replace $HOME prefix with ~
+                        let path_str = if let Some(home) = std::env::var_os("HOME") {
+                            let abs = img_path.to_string_lossy();
+                            let home_str = home.to_string_lossy();
+                            if abs.starts_with(home_str.as_ref()) {
+                                format!("~{}", &abs[home_str.len()..])
+                            } else {
+                                abs.into_owned()
+                            }
+                        } else {
+                            img_path.to_string_lossy().into_owned()
+                        };
+                        self.log_debug(format!("app_paste: saved → {path_str}"));
+                        self.terminal_tabs[ti].panes[pi].paste_chip = Some(filename);
+                        self.terminal_tabs[ti].panes[pi].paste_text(&path_str);
+                    } else {
+                        self.log_debug("app_paste: save_clipboard_image returned None".to_owned());
+                    }
+                    for msg in img_logs {
+                        self.log_debug(msg);
+                    }
+                }
+            }
+        }
+
         let open_new_tab =
             ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::T));
         let insert_checkbox =
@@ -2720,7 +3134,6 @@ impl eframe::App for GhostStickiesApp {
 
         let mut start_drag = false;
         let mut quit_requested = false;
-        let mut restart_clicked = false;
         let mut privacy_toggled = false;
         let mut theme_changed = None;
 
@@ -2863,21 +3276,6 @@ impl eframe::App for GhostStickiesApp {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("\u{21BB}")
-                                        .size(14.0)
-                                        .color(palette.muted_text),
-                                )
-                                .frame(false),
-                            )
-                            .on_hover_text("Restart shell")
-                            .clicked()
-                        {
-                            restart_clicked = true;
-                        }
-
                         if Self::symbol_button(
                             ui,
                             AppSymbol::Privacy,
@@ -2892,6 +3290,23 @@ impl eframe::App for GhostStickiesApp {
                         {
                             privacy_toggled = true;
                         }
+
+                        ui.menu_button(
+                            egui::RichText::new("Help")
+                                .size(12.0)
+                                .color(palette.muted_text),
+                            |ui| {
+                                let logs_label = if self.show_debug {
+                                    "Hide Logs"
+                                } else {
+                                    "View Logs"
+                                };
+                                if ui.selectable_label(self.show_debug, logs_label).clicked() {
+                                    self.show_debug = !self.show_debug;
+                                    ui.close();
+                                }
+                            },
+                        );
 
                         ui.menu_button(
                             egui::RichText::new("Theme")
@@ -2923,10 +3338,6 @@ impl eframe::App for GhostStickiesApp {
         if privacy_toggled {
             self.privacy_mode = !self.privacy_mode;
             self.apply_window_mode(ctx);
-        }
-
-        if restart_clicked {
-            self.active_tab_mut().active_pane_mut().restart();
         }
 
         if quit_requested {
