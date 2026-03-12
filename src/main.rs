@@ -349,21 +349,6 @@ impl TerminalPane {
         self.status = format!("Interactive shell in {}", self.cwd.display());
     }
 
-    fn restart(&mut self) {
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-        }
-
-        self.rx = None;
-        self.writer = None;
-        self.master = None;
-        self.child = None;
-        self.selection = None;
-        self.parser = Parser::new(self.rows, self.cols, TERMINAL_SCROLLBACK);
-        self.status = format!("Restarting shell in {}", self.cwd.display());
-        self.ensure_started();
-    }
-
     fn set_scrollback(&mut self, rows: usize) {
         self.parser.screen_mut().set_scrollback(rows);
     }
@@ -434,12 +419,6 @@ impl TerminalPane {
         }
     }
 
-    fn send_text(&mut self, text: &str) {
-        self.selection = None;
-        self.set_scrollback(0);
-        self.write_bytes(text.as_bytes());
-    }
-
     fn point_is_before(a: TerminalPoint, b: TerminalPoint) -> bool {
         a.row < b.row || (a.row == b.row && a.col <= b.col)
     }
@@ -451,13 +430,6 @@ impl TerminalPane {
         } else {
             Some((focus, anchor))
         }
-    }
-
-    fn selection_exists(&self) -> bool {
-        matches!(
-            self.normalized_selection(),
-            Some((start, end)) if start.row != end.row || start.col != end.col
-        )
     }
 
     fn select_all(&mut self) {
@@ -886,9 +858,8 @@ fn install_paste_monitor() {
             addLocalMonitorForEventsMatchingMask: (1u64 << 10)
             handler: block as *const GlobalBlock
         ];
-        // The monitor is retained internally by NSEvent; we intentionally
-        // let this object live forever (app lifetime).
-        std::mem::forget(monitor);
+        // The monitor is retained internally by NSEvent for the app lifetime.
+        let _ = monitor;
     }
 }
 
@@ -1074,10 +1045,6 @@ impl TerminalTab {
         &self.panes[self.active_pane]
     }
 
-    fn active_pane_mut(&mut self) -> &mut TerminalPane {
-        &mut self.panes[self.active_pane]
-    }
-
     fn split_pane(&mut self, uid: u64) {
         let cwd = self.panes[self.active_pane].cwd.clone();
         let insert_at = self.active_pane + 1;
@@ -1158,40 +1125,6 @@ fn default_terminal_cwd() -> PathBuf {
     }
 
     home_dir.unwrap_or_else(|| PathBuf::from("."))
-}
-
-fn display_path_short(path: &Path) -> String {
-    if let Some(home) = std::env::var_os("HOME") {
-        let home_path = PathBuf::from(&home);
-        if let Ok(relative) = path.strip_prefix(&home_path) {
-            return format!("~/{}", relative.display());
-        }
-    }
-    path.display().to_string()
-}
-
-fn git_branch(dir: &Path) -> Option<String> {
-    let head_file = dir.join(".git").join("HEAD");
-    let contents = fs::read_to_string(head_file).ok()?;
-    let trimmed = contents.trim();
-    if let Some(branch) = trimmed.strip_prefix("ref: refs/heads/") {
-        Some(branch.to_owned())
-    } else {
-        Some(trimmed[..8.min(trimmed.len())].to_owned())
-    }
-}
-
-fn git_repo_name(dir: &Path) -> Option<String> {
-    let mut current = dir;
-    loop {
-        if current.join(".git").exists() {
-            return current
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| s.to_owned());
-        }
-        current = current.parent()?;
-    }
 }
 
 impl Default for GhostStickiesApp {
@@ -1590,6 +1523,265 @@ impl GhostStickiesApp {
         leading / 2
     }
 
+    fn markdown_checkbox(
+        ui: &mut egui::Ui,
+        checked: &mut bool,
+        palette: ThemePalette,
+    ) -> egui::Response {
+        let size = egui::vec2(18.0, 18.0);
+        let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click());
+
+        if response.clicked() {
+            *checked = !*checked;
+            response.mark_changed();
+        }
+
+        let border = egui::Color32::from_rgba_premultiplied(255, 255, 255, 235);
+        let fill = if *checked {
+            egui::Color32::WHITE
+        } else if response.hovered() {
+            egui::Color32::from_rgba_premultiplied(255, 255, 255, 14)
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+
+        ui.painter().rect(
+            rect,
+            egui::CornerRadius::same(5),
+            fill,
+            egui::Stroke::new(1.25, border),
+            egui::StrokeKind::Inside,
+        );
+
+        if *checked {
+            let stroke = egui::Stroke::new(2.3, egui::Color32::BLACK);
+            let a = egui::pos2(rect.left() + 4.2, rect.center().y + 0.4);
+            let b = egui::pos2(rect.left() + 7.8, rect.bottom() - 4.6);
+            let c = egui::pos2(rect.right() - 3.6, rect.top() + 5.0);
+            ui.painter().line_segment([a, b], stroke);
+            ui.painter().line_segment([b, c], stroke);
+        }
+
+        if response.hovered() {
+            ui.painter().rect_stroke(
+                rect.expand(0.5),
+                egui::CornerRadius::same(5),
+                egui::Stroke::new(1.0, palette.accent.linear_multiply(0.45)),
+                egui::StrokeKind::Outside,
+            );
+        }
+
+        response
+    }
+
+    fn append_markdown_segment(
+        job: &mut egui::text::LayoutJob,
+        text: &str,
+        palette: ThemePalette,
+        base_color: egui::Color32,
+        base_size: f32,
+        bold: bool,
+        italic: bool,
+        code: bool,
+        link: bool,
+        strikethrough: bool,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+
+        let mut format = egui::TextFormat {
+            font_id: if code {
+                egui::FontId::monospace((base_size - 1.0).max(12.0))
+            } else {
+                egui::FontId::proportional(base_size)
+            },
+            color: if code {
+                egui::Color32::WHITE
+            } else if link {
+                palette.accent
+            } else {
+                base_color
+            },
+            italics: italic,
+            background: if code {
+                palette.input_bg.linear_multiply(1.25)
+            } else {
+                egui::Color32::TRANSPARENT
+            },
+            ..Default::default()
+        };
+
+        if bold {
+            format.font_id.size += 0.5;
+        }
+
+        if link {
+            format.underline = egui::Stroke::new(1.0, palette.accent.linear_multiply(0.8));
+        }
+
+        if strikethrough {
+            format.strikethrough = egui::Stroke::new(1.0, format.color.linear_multiply(0.7));
+        }
+
+        job.append(text, 0.0, format);
+    }
+
+    fn inline_markdown_job(
+        text: &str,
+        palette: ThemePalette,
+        base_color: egui::Color32,
+        base_size: f32,
+        strikethrough: bool,
+    ) -> egui::text::LayoutJob {
+        let mut job = egui::text::LayoutJob::default();
+        let mut buffer = String::new();
+        let mut i = 0usize;
+        let mut bold = false;
+        let mut italic = false;
+        let mut code = false;
+
+        while i < text.len() {
+            let rest = &text[i..];
+
+            if !code && rest.starts_with("**") {
+                Self::append_markdown_segment(
+                    &mut job,
+                    &buffer,
+                    palette,
+                    base_color,
+                    base_size,
+                    bold,
+                    italic,
+                    code,
+                    false,
+                    strikethrough,
+                );
+                buffer.clear();
+                bold = !bold;
+                i += 2;
+                continue;
+            }
+
+            if rest.starts_with('`') {
+                Self::append_markdown_segment(
+                    &mut job,
+                    &buffer,
+                    palette,
+                    base_color,
+                    base_size,
+                    bold,
+                    italic,
+                    code,
+                    false,
+                    strikethrough,
+                );
+                buffer.clear();
+                code = !code;
+                i += 1;
+                continue;
+            }
+
+            if !code && rest.starts_with('*') {
+                Self::append_markdown_segment(
+                    &mut job,
+                    &buffer,
+                    palette,
+                    base_color,
+                    base_size,
+                    bold,
+                    italic,
+                    code,
+                    false,
+                    strikethrough,
+                );
+                buffer.clear();
+                italic = !italic;
+                i += 1;
+                continue;
+            }
+
+            if !code && rest.starts_with('[') {
+                if let Some(close_bracket) = rest.find("](") {
+                    let after_open = &rest[1..close_bracket];
+                    let link_rest = &rest[close_bracket + 2..];
+                    if let Some(close_paren) = link_rest.find(')') {
+                        Self::append_markdown_segment(
+                            &mut job,
+                            &buffer,
+                            palette,
+                            base_color,
+                            base_size,
+                            bold,
+                            italic,
+                            code,
+                            false,
+                            strikethrough,
+                        );
+                        buffer.clear();
+                        Self::append_markdown_segment(
+                            &mut job,
+                            after_open,
+                            palette,
+                            base_color,
+                            base_size,
+                            bold,
+                            italic,
+                            false,
+                            true,
+                            strikethrough,
+                        );
+                        i += close_bracket + 2 + close_paren + 1;
+                        continue;
+                    }
+                }
+            }
+
+            let mut chars = rest.chars();
+            if let Some(ch) = chars.next() {
+                buffer.push(ch);
+                i += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+
+        Self::append_markdown_segment(
+            &mut job,
+            &buffer,
+            palette,
+            base_color,
+            base_size,
+            bold,
+            italic,
+            code,
+            false,
+            strikethrough,
+        );
+
+        job
+    }
+
+    fn markdown_label(
+        ui: &mut egui::Ui,
+        text: &str,
+        palette: ThemePalette,
+        base_color: egui::Color32,
+        base_size: f32,
+        strikethrough: bool,
+    ) {
+        ui.add(
+            egui::Label::new(Self::inline_markdown_job(
+                text,
+                palette,
+                base_color,
+                base_size,
+                strikethrough,
+            ))
+            .wrap_mode(egui::TextWrapMode::Wrap),
+        );
+    }
+
     fn render_markdown_preview(
         ui: &mut egui::Ui,
         markdown: &mut String,
@@ -1603,7 +1795,7 @@ impl GhostStickiesApp {
             .max_height(available_height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.spacing_mut().item_spacing.y = 6.0;
 
                 let lines: Vec<String> = markdown.lines().map(|s| s.to_owned()).collect();
                 let mut line_idx = 0;
@@ -1622,39 +1814,28 @@ impl GhostStickiesApp {
 
                     // Headings (no indent)
                     if let Some(heading) = trimmed.strip_prefix("### ") {
-                        ui.add_space(4.0);
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(heading)
-                                    .size(14.0)
-                                    .strong()
-                                    .color(palette.text),
-                            )
-                            .wrap_mode(egui::TextWrapMode::Wrap),
-                        );
                         ui.add_space(2.0);
+                        Self::markdown_label(ui, heading, palette, palette.text, 15.0, false);
                     } else if let Some(heading) = trimmed.strip_prefix("## ") {
                         ui.add_space(6.0);
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(heading)
-                                    .size(16.0)
-                                    .strong()
-                                    .color(palette.text),
-                            )
-                            .wrap_mode(egui::TextWrapMode::Wrap),
+                        Self::markdown_label(ui, heading, palette, palette.text, 17.0, false);
+                        let rule = egui::vec2(ui.available_width().min(160.0), 2.0);
+                        let (rect, _) = ui.allocate_exact_size(rule, egui::Sense::hover());
+                        ui.painter().rect_filled(
+                            rect,
+                            egui::CornerRadius::same(2),
+                            palette.accent.linear_multiply(0.45),
                         );
-                        ui.add_space(3.0);
+                        ui.add_space(2.0);
                     } else if let Some(heading) = trimmed.strip_prefix("# ") {
                         ui.add_space(8.0);
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(heading)
-                                    .size(20.0)
-                                    .strong()
-                                    .color(palette.text),
-                            )
-                            .wrap_mode(egui::TextWrapMode::Wrap),
+                        Self::markdown_label(ui, heading, palette, palette.text, 21.0, false);
+                        let rule = egui::vec2(ui.available_width().min(220.0), 2.0);
+                        let (rect, _) = ui.allocate_exact_size(rule, egui::Sense::hover());
+                        ui.painter().rect_filled(
+                            rect,
+                            egui::CornerRadius::same(2),
+                            palette.accent.linear_multiply(0.6),
                         );
                         ui.add_space(4.0);
                     }
@@ -1666,17 +1847,17 @@ impl GhostStickiesApp {
                                 ui.add_space(left_margin);
                             }
                             let mut checked = true;
-                            if ui.checkbox(&mut checked, "").changed() {
+                            if Self::markdown_checkbox(ui, &mut checked, palette).changed() {
                                 Self::toggle_line_checkbox(markdown, line_idx, false);
                                 changed = true;
                             }
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(task_text)
-                                        .strikethrough()
-                                        .color(palette.muted_text),
-                                )
-                                .wrap_mode(egui::TextWrapMode::Wrap),
+                            Self::markdown_label(
+                                ui,
+                                task_text,
+                                palette,
+                                palette.muted_text,
+                                14.0,
+                                true,
                             );
                         });
                     }
@@ -1688,33 +1869,107 @@ impl GhostStickiesApp {
                                 ui.add_space(left_margin);
                             }
                             let mut checked = false;
-                            if ui.checkbox(&mut checked, "").changed() {
+                            if Self::markdown_checkbox(ui, &mut checked, palette).changed() {
                                 Self::toggle_line_checkbox(markdown, line_idx, true);
                                 changed = true;
                             }
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(task_text).color(palette.text),
-                                )
-                                .wrap_mode(egui::TextWrapMode::Wrap),
-                            );
+                            Self::markdown_label(ui, task_text, palette, palette.text, 14.0, false);
                         });
                     }
                     // Bullet point
-                    else if let Some(bullet_text) = trimmed.strip_prefix("- ") {
+                    else if let Some(bullet_text) = trimmed
+                        .strip_prefix("- ")
+                        .or_else(|| trimmed.strip_prefix("* "))
+                    {
                         ui.horizontal_wrapped(|ui| {
                             if left_margin > 0.0 {
                                 ui.add_space(left_margin);
                             }
-                            ui.label(egui::RichText::new("\u{2022}").color(palette.accent));
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(Self::render_inline_markdown(bullet_text))
-                                        .color(palette.text),
-                                )
-                                .wrap_mode(egui::TextWrapMode::Wrap),
+                            ui.label(
+                                egui::RichText::new("\u{2022}")
+                                    .size(16.0)
+                                    .color(palette.accent),
                             );
+                            Self::markdown_label(ui, bullet_text, palette, palette.text, 14.0, false);
                         });
+                    }
+                    // Numbered list
+                    else if let Some((number, item_text)) = trimmed.split_once(". ").filter(|(n, _)| {
+                        !n.is_empty() && n.chars().all(|ch| ch.is_ascii_digit())
+                    }) {
+                        ui.horizontal_wrapped(|ui| {
+                            if left_margin > 0.0 {
+                                ui.add_space(left_margin);
+                            }
+                            ui.label(
+                                egui::RichText::new(format!("{number}."))
+                                    .strong()
+                                    .color(palette.accent),
+                            );
+                            Self::markdown_label(ui, item_text, palette, palette.text, 14.0, false);
+                        });
+                    }
+                    // Block quote
+                    else if let Some(quote_text) = trimmed.strip_prefix("> ") {
+                        egui::Frame::NONE
+                            .fill(palette.sidebar_soft_bg.linear_multiply(0.55))
+                            .stroke(egui::Stroke::new(1.0, palette.border))
+                            .corner_radius(egui::CornerRadius::same(8))
+                            .inner_margin(egui::Margin::symmetric(10, 8))
+                            .show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("\u{258d}")
+                                            .size(18.0)
+                                            .color(palette.accent),
+                                    );
+                                    Self::markdown_label(
+                                        ui,
+                                        quote_text,
+                                        palette,
+                                        palette.muted_text,
+                                        14.0,
+                                        false,
+                                    );
+                                });
+                            });
+                    }
+                    // Code fence
+                    else if trimmed.starts_with("```") {
+                        let mut code_lines = Vec::new();
+                        line_idx += 1;
+
+                        while line_idx < lines.len() {
+                            let code_line = &lines[line_idx];
+                            if code_line.trim().starts_with("```") {
+                                break;
+                            }
+                            code_lines.push(code_line.clone());
+                            line_idx += 1;
+                        }
+
+                        let code_block = if code_lines.is_empty() {
+                            " ".to_owned()
+                        } else {
+                            code_lines.join("\n")
+                        };
+
+                        egui::Frame::NONE
+                            .fill(palette.input_bg)
+                            .stroke(egui::Stroke::new(1.0, palette.border))
+                            .corner_radius(egui::CornerRadius::same(8))
+                            .inner_margin(egui::Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(code_block)
+                                            .monospace()
+                                            .size(13.0)
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .wrap_mode(egui::TextWrapMode::Wrap),
+                                );
+                            });
                     }
                     // Horizontal rule
                     else if trimmed == "---" || trimmed == "***" || trimmed == "___" {
@@ -1727,22 +1982,17 @@ impl GhostStickiesApp {
                         if left_margin > 0.0 {
                             ui.horizontal_wrapped(|ui| {
                                 ui.add_space(left_margin);
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(Self::render_inline_markdown(trimmed))
-                                            .color(palette.text),
-                                    )
-                                    .wrap_mode(egui::TextWrapMode::Wrap),
+                                Self::markdown_label(
+                                    ui,
+                                    trimmed,
+                                    palette,
+                                    palette.text,
+                                    14.0,
+                                    false,
                                 );
                             });
                         } else {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(Self::render_inline_markdown(trimmed))
-                                        .color(palette.text),
-                                )
-                                .wrap_mode(egui::TextWrapMode::Wrap),
-                            );
+                            Self::markdown_label(ui, trimmed, palette, palette.text, 14.0, false);
                         }
                     }
 
@@ -1751,33 +2001,6 @@ impl GhostStickiesApp {
             });
 
         changed
-    }
-
-    fn render_inline_markdown(text: &str) -> String {
-        let text = text.replace("**", "").replace('*', "");
-        // Strip [link text](url) -> link text
-        let mut result = String::new();
-        let mut rest = text.as_str();
-        while let Some(bracket_start) = rest.find('[') {
-            result.push_str(&rest[..bracket_start]);
-            let after_open = &rest[bracket_start + 1..];
-            if let Some(bracket_end) = after_open.find("](") {
-                let link_text = &after_open[..bracket_end];
-                let after_paren = &after_open[bracket_end + 2..];
-                if let Some(paren_end) = after_paren.find(')') {
-                    result.push_str(link_text);
-                    rest = &after_paren[paren_end + 1..];
-                } else {
-                    result.push('[');
-                    rest = after_open;
-                }
-            } else {
-                result.push('[');
-                rest = after_open;
-            }
-        }
-        result.push_str(rest);
-        result
     }
 
     /// Scan one terminal row and return URL spans as (start_col, end_col_inclusive, url).
@@ -3404,35 +3627,7 @@ impl eframe::App for GhostStickiesApp {
 
                     ui.add_space(12.0);
 
-                    // Git / path info
-                    let cwd = &self.active_tab().active_pane().cwd;
-                    let short_path = display_path_short(cwd);
-                    if let Some(repo) = git_repo_name(cwd) {
-                        ui.label(
-                            egui::RichText::new(&repo)
-                                .size(12.5)
-                                .color(palette.accent)
-                                .strong(),
-                        );
-                        if let Some(branch) = git_branch(cwd) {
-                            ui.label(
-                                egui::RichText::new("|")
-                                    .size(11.0)
-                                    .color(palette.muted_text),
-                            );
-                            ui.label(
-                                egui::RichText::new(&branch)
-                                    .size(12.0)
-                                    .color(palette.muted_text),
-                            );
-                        }
-                    } else {
-                        ui.label(
-                            egui::RichText::new(&short_path)
-                                .size(12.5)
-                                .color(palette.text),
-                        );
-                    }
+                    ui.add_space(8.0);
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if Self::symbol_button(
@@ -3630,25 +3825,21 @@ impl eframe::App for GhostStickiesApp {
                                     {
                                         let recent_copy = self.recent_notes.clone();
                                         if !recent_copy.is_empty() {
-                                            egui::menu::menu_custom_button(
-                                                ui,
+                                            let _ = egui::containers::menu::MenuButton::from_button(
                                                 Self::note_action_button("Recent", palette),
-                                                |ui| {
-                                                    for path in &recent_copy {
-                                                        let name = path
-                                                            .file_name()
-                                                            .and_then(|n| n.to_str())
-                                                            .unwrap_or("?");
-                                                        if ui
-                                                            .selectable_label(false, name)
-                                                            .clicked()
-                                                        {
-                                                            open_recent_note = Some(path.clone());
-                                                            ui.close();
-                                                        }
+                                            )
+                                            .ui(ui, |ui| {
+                                                for path in &recent_copy {
+                                                    let name = path
+                                                        .file_name()
+                                                        .and_then(|n| n.to_str())
+                                                        .unwrap_or("?");
+                                                    if ui.selectable_label(false, name).clicked() {
+                                                        open_recent_note = Some(path.clone());
+                                                        ui.close();
                                                     }
-                                                },
-                                            );
+                                                }
+                                            });
                                         }
                                     }
                                     if ui
