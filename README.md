@@ -68,6 +68,69 @@ Each time you want an updated app:
 
 If you launch the app from Finder, the terminal will start in your home folder by default.
 
+## Build a shareable DMG
+
+To make a nice installer DMG with a drag-to-Applications layout:
+
+```bash
+./scripts/build-dmg.sh
+```
+
+That will build:
+
+```bash
+dist/StickyTerminal-0.1.0.dmg
+```
+
+## Sign and notarize for sharing
+
+If you have the paid Apple Developer Program, you can sign and notarize the app properly.
+
+### 1. Install your Developer ID certificate
+
+You need this certificate in your login keychain:
+
+```text
+Developer ID Application
+```
+
+You can create and download it from your Apple Developer account, then install it by opening the downloaded certificate file on your Mac.
+
+To check if it is installed:
+
+```bash
+security find-identity -v -p codesigning
+```
+
+### 2. Save your notary credentials
+
+Create a Keychain profile for notarization:
+
+```bash
+./scripts/setup-notary-profile.sh stickyterminal-notary your-apple-id@example.com YOURTEAMID
+```
+
+Apple will prompt for an app-specific password if needed.
+
+### 3. Sign and notarize everything
+
+Then run:
+
+```bash
+./scripts/sign-and-notarize.sh
+```
+
+This script will:
+
+1. build the app
+2. sign it with your Developer ID certificate
+3. notarize the app
+4. staple the app ticket
+5. build the DMG
+6. sign the DMG
+7. notarize the DMG
+8. staple the DMG ticket
+
 ## Notes
 
 When you open the notes panel:

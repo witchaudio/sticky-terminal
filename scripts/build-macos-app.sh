@@ -15,6 +15,7 @@ APP_DIR="$DIST_DIR/$APP_NAME.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
+SIGN_IDENTITY="${APPLE_DEVELOPER_IDENTITY:-}"
 
 PACKAGE_NAME="$(sed -n 's/^name = "\(.*\)"/\1/p' "$ROOT_DIR/Cargo.toml" | head -n 1)"
 APP_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT_DIR/Cargo.toml" | head -n 1)"
@@ -78,8 +79,21 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 PLIST
 
 if command -v codesign >/dev/null 2>&1; then
-  echo "Applying ad-hoc code signature..."
-  codesign --force --deep --sign - "$APP_DIR" >/dev/null
+  if [[ -n "$SIGN_IDENTITY" ]]; then
+    echo "Signing app with Developer ID identity:"
+    echo "  $SIGN_IDENTITY"
+    codesign \
+      --force \
+      --sign "$SIGN_IDENTITY" \
+      --options runtime \
+      --timestamp \
+      "$APP_DIR"
+    echo "Verifying code signature..."
+    codesign --verify --deep --strict --verbose=2 "$APP_DIR"
+  else
+    echo "Applying ad-hoc code signature..."
+    codesign --force --deep --sign - "$APP_DIR" >/dev/null
+  fi
 fi
 
 echo
